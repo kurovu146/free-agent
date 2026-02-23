@@ -9,6 +9,7 @@ use crate::db::Database;
 use crate::provider::ProviderPool;
 use crate::skills;
 
+
 struct AppState {
     pool: ProviderPool,
     db: Database,
@@ -31,11 +32,28 @@ pub async fn run_bot(config: Config) {
 
     let skills_content = skills::load_skills("skills");
 
-    let base_prompt = r#"You are a helpful AI assistant running as a Telegram bot.
-You have access to tools: web_search, memory_save, memory_search, memory_list.
-Use tools when needed to help the user. Be concise — responses will be sent via Telegram.
-Always respond in the same language the user uses."#
-        .to_string();
+    // Build tool list dynamically based on config
+    let gmail_ok = config.gmail_creds.is_configured();
+    let mut tool_list = vec![
+        "web_search", "web_fetch", "memory_save", "memory_search",
+        "memory_list", "memory_delete", "get_datetime",
+    ];
+    if gmail_ok {
+        tool_list.extend(&[
+            "gmail_search", "gmail_read", "gmail_send", "gmail_archive",
+            "gmail_trash", "gmail_label", "gmail_list_labels",
+            "sheets_read", "sheets_write", "sheets_append",
+            "sheets_list", "sheets_create_tab",
+        ]);
+    }
+
+    let base_prompt = format!(
+        "You are a helpful AI assistant running as a Telegram bot.\n\
+        You have access to tools: {}.\n\
+        Use tools when needed to help the user. Be concise — responses will be sent via Telegram.\n\
+        Always respond in the same language the user uses.",
+        tool_list.join(", ")
+    );
 
     let state = Arc::new(AppState {
         pool,
@@ -46,8 +64,10 @@ Always respond in the same language the user uses."#
     });
 
     info!(
-        "Bot started. Providers: {:?}, Allowed users: {:?}",
+        "Bot started. Providers: {:?}, Tools: {}, Gmail: {}, Allowed users: {:?}",
         state.pool.available_providers(),
+        tool_list.len(),
+        if gmail_ok { "enabled" } else { "disabled" },
         config.allowed_users
     );
 
@@ -105,6 +125,7 @@ async fn handle_message(
         &text,
         user_id,
         &state.db,
+        &state.config.gmail_creds,
         state.config.max_agent_turns,
     )
     .await;
@@ -145,10 +166,15 @@ async fn handle_command(
 ) -> ResponseResult<()> {
     match text.split_whitespace().next().unwrap_or("") {
         "/start" => {
+            let gmail_status = if state.config.gmail_creds.is_configured() {
+                "Gmail/Sheets: enabled"
+            } else {
+                "Gmail/Sheets: not configured"
+            };
             bot.send_message(
                 msg.chat.id,
                 format!(
-                    "Free Agent Bot\n\nProviders: {}\nTools: web_search, memory\n\n/help for commands",
+                    "Free Agent Bot\n\nProviders: {}\nTools: web, memory, datetime, gmail, sheets\n{gmail_status}\n\n/help for commands",
                     state.pool.available_providers().join(", ")
                 ),
             )
@@ -160,7 +186,8 @@ async fn handle_command(
                 "/start — Bot info\n\
                  /help — Show commands\n\
                  /memory — List saved facts\n\
-                 /providers — Show available providers",
+                 /providers — Show available providers\n\
+                 /tools — List available tools",
             )
             .await?;
         }
@@ -185,6 +212,35 @@ async fn handle_command(
                 format!("Available: {}", state.pool.available_providers().join(", ")),
             )
             .await?;
+        }
+        "/tools" => {
+            let gmail_ok = state.config.gmail_creds.is_configured();
+            let mut tools = vec![
+                "web_search — Search the web",
+                "web_fetch — Fetch URL content",
+                "memory_save — Save a fact",
+                "memory_search — Search memory",
+                "memory_list — List all facts",
+                "memory_delete — Delete a fact",
+                "get_datetime — Current date/time",
+            ];
+            if gmail_ok {
+                tools.extend(&[
+                    "gmail_search — Search emails",
+                    "gmail_read — Read email",
+                    "gmail_send — Send email",
+                    "gmail_archive — Archive emails",
+                    "gmail_trash — Trash emails",
+                    "gmail_label — Add/remove labels",
+                    "gmail_list_labels — List labels",
+                    "sheets_read — Read spreadsheet",
+                    "sheets_write — Write to spreadsheet",
+                    "sheets_append — Append rows",
+                    "sheets_list — List sheet tabs",
+                    "sheets_create_tab — Create new tab",
+                ]);
+            }
+            bot.send_message(msg.chat.id, tools.join("\n")).await?;
         }
         _ => {
             bot.send_message(msg.chat.id, "Unknown command. /help")

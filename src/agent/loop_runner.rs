@@ -2,6 +2,7 @@ use tracing::{debug, info, warn};
 
 use crate::db::Database;
 use crate::provider::{Message, MessageContent, ProviderPool, Role};
+use crate::tools::gmail::GmailCreds;
 
 use super::tool_registry::ToolRegistry;
 
@@ -15,9 +16,10 @@ impl AgentLoop {
         user_message: &str,
         user_id: u64,
         db: &Database,
+        gmail_creds: &GmailCreds,
         max_turns: usize,
     ) -> Result<String, String> {
-        let tools = ToolRegistry::definitions();
+        let tools = ToolRegistry::definitions(gmail_creds.is_configured());
 
         let mut messages = vec![
             Message {
@@ -63,9 +65,14 @@ impl AgentLoop {
             for tc in &response.tool_calls {
                 debug!("Executing tool: {}({})", tc.function.name, tc.function.arguments);
 
-                let result =
-                    ToolRegistry::execute(&tc.function.name, &tc.function.arguments, user_id, db)
-                        .await;
+                let result = ToolRegistry::execute(
+                    &tc.function.name,
+                    &tc.function.arguments,
+                    user_id,
+                    db,
+                    gmail_creds,
+                )
+                .await;
 
                 messages.push(Message {
                     role: Role::Tool,
@@ -78,13 +85,12 @@ impl AgentLoop {
         }
 
         warn!("Agent hit max turns ({max_turns})");
-        // Return whatever we have so far
         let last_assistant = messages
             .iter()
             .rev()
             .find(|m| m.role == Role::Assistant)
             .map(|m| m.content.as_text().to_string())
-            .unwrap_or_else(|| "Đã đạt giới hạn xử lý. Vui lòng thử lại.".into());
+            .unwrap_or_else(|| "Reached max processing limit. Please try again.".into());
 
         Ok(last_assistant)
     }

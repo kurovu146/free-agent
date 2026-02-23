@@ -27,6 +27,14 @@ pub async fn memory_search(db: &Database, user_id: u64, keyword: &str) -> String
     }
 }
 
+pub async fn memory_delete(db: &Database, user_id: u64, fact_id: i64) -> String {
+    match db.delete_fact(user_id, fact_id) {
+        Ok(true) => format!("Deleted memory ID: {fact_id}"),
+        Ok(false) => format!("Memory ID {fact_id} not found or not yours"),
+        Err(e) => format!("Error deleting: {e}"),
+    }
+}
+
 pub async fn memory_list(db: &Database, user_id: u64, category: Option<&str>) -> String {
     match db.list_facts(user_id, category) {
         Ok(results) if results.is_empty() => "No facts saved yet.".into(),

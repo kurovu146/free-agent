@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::tools::gmail::GmailCreds;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub telegram_bot_token: String,
@@ -14,6 +16,9 @@ pub struct Config {
     pub default_provider: String,
     pub max_agent_turns: usize,
     pub max_queue_depth: usize,
+
+    // Google OAuth (Gmail + Sheets)
+    pub gmail_creds: GmailCreds,
 }
 
 impl Config {
@@ -41,6 +46,11 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3),
+            gmail_creds: GmailCreds {
+                client_id: env::var("GMAIL_CLIENT_ID").unwrap_or_default(),
+                client_secret: env::var("GMAIL_CLIENT_SECRET").unwrap_or_default(),
+                refresh_token: env::var("GMAIL_REFRESH_TOKEN").unwrap_or_default(),
+            },
         }
     }
 }

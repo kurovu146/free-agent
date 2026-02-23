@@ -90,6 +90,71 @@ fn parse_ddg_html(html: &str) -> String {
     }
 }
 
+/// Fetch a URL and extract readable text content
+pub async fn web_fetch(url: &str) -> String {
+    if url.is_empty() {
+        return "Error: empty URL".into();
+    }
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    match client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; FreeAgent/1.0)")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                return format!("HTTP {status} fetching {url}");
+            }
+            match resp.text().await {
+                Ok(body) => {
+                    let text = html_to_text(&body);
+                    if text.len() > 8000 {
+                        format!("{}\n\n[... truncated, {} chars total]", &text[..8000], text.len())
+                    } else {
+                        text
+                    }
+                }
+                Err(e) => format!("Error reading body: {e}"),
+            }
+        }
+        Err(e) => format!("Fetch error: {e}"),
+    }
+}
+
+/// Convert HTML to readable plain text
+fn html_to_text(html: &str) -> String {
+    let mut result = html.to_string();
+    // Remove script/style blocks
+    for tag in &["script", "style", "noscript", "svg"] {
+        while let Some(start) = result.find(&format!("<{tag}")) {
+            if let Some(end) = result[start..].find(&format!("</{tag}>")) {
+                let end_abs = start + end + tag.len() + 3;
+                result.replace_range(start..end_abs, " ");
+            } else {
+                break;
+            }
+        }
+    }
+    // Block tags → newlines
+    for tag in &["p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr"] {
+        result = result.replace(&format!("<{tag}"), &format!("\n<{tag}"));
+        result = result.replace(&format!("</{tag}>"), &format!("</{tag}>\n"));
+    }
+    let text = strip_html_tags(&result);
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn strip_html_tags(s: &str) -> String {
     let mut result = String::new();
     let mut in_tag = false;

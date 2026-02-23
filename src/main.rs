@@ -1,10 +1,10 @@
 mod agent;
-mod config;
 mod db;
 mod provider;
 mod skills;
-mod telegram;
 mod tools;
+mod config;
+mod telegram;
 
 use config::Config;
 use tracing_subscriber::EnvFilter;
