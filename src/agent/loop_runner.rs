@@ -17,9 +17,12 @@ impl AgentLoop {
         user_id: u64,
         db: &Database,
         gmail_creds: &GmailCreds,
+        system_tools_enabled: bool,
+        working_dir: &str,
+        bash_timeout: u64,
         max_turns: usize,
     ) -> Result<String, String> {
-        let tools = ToolRegistry::definitions(gmail_creds.is_configured());
+        let tools = ToolRegistry::definitions(gmail_creds.is_configured(), system_tools_enabled);
 
         let mut messages = vec![
             Message {
@@ -71,6 +74,8 @@ impl AgentLoop {
                     user_id,
                     db,
                     gmail_creds,
+                    working_dir,
+                    bash_timeout,
                 )
                 .await;
 

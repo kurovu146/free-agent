@@ -19,6 +19,11 @@ pub struct Config {
 
     // Google OAuth (Gmail + Sheets)
     pub gmail_creds: GmailCreds,
+
+    // System tools
+    pub enable_system_tools: bool,
+    pub working_dir: String,
+    pub bash_timeout: u64,
 }
 
 impl Config {
@@ -51,6 +56,14 @@ impl Config {
                 client_secret: env::var("GMAIL_CLIENT_SECRET").unwrap_or_default(),
                 refresh_token: env::var("GMAIL_REFRESH_TOKEN").unwrap_or_default(),
             },
+            enable_system_tools: env::var("ENABLE_SYSTEM_TOOLS")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            working_dir: env::var("WORKING_DIR").unwrap_or_else(|_| ".".into()),
+            bash_timeout: env::var("BASH_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
         }
     }
 }

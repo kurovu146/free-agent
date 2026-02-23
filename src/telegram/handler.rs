@@ -9,7 +9,6 @@ use crate::db::Database;
 use crate::provider::ProviderPool;
 use crate::skills;
 
-
 struct AppState {
     pool: ProviderPool,
     db: Database,
@@ -34,10 +33,14 @@ pub async fn run_bot(config: Config) {
 
     // Build tool list dynamically based on config
     let gmail_ok = config.gmail_creds.is_configured();
+    let sys_ok = config.enable_system_tools;
     let mut tool_list = vec![
         "web_search", "web_fetch", "memory_save", "memory_search",
         "memory_list", "memory_delete", "get_datetime",
     ];
+    if sys_ok {
+        tool_list.extend(&["bash", "read", "write", "glob", "grep"]);
+    }
     if gmail_ok {
         tool_list.extend(&[
             "gmail_search", "gmail_read", "gmail_send", "gmail_archive",
@@ -64,9 +67,10 @@ pub async fn run_bot(config: Config) {
     });
 
     info!(
-        "Bot started. Providers: {:?}, Tools: {}, Gmail: {}, Allowed users: {:?}",
+        "Bot started. Providers: {:?}, Tools: {}, SystemTools: {}, Gmail: {}, Allowed users: {:?}",
         state.pool.available_providers(),
         tool_list.len(),
+        if sys_ok { "enabled" } else { "disabled" },
         if gmail_ok { "enabled" } else { "disabled" },
         config.allowed_users
     );
@@ -126,6 +130,9 @@ async fn handle_message(
         user_id,
         &state.db,
         &state.config.gmail_creds,
+        state.config.enable_system_tools,
+        &state.config.working_dir,
+        state.config.bash_timeout,
         state.config.max_agent_turns,
     )
     .await;
@@ -137,7 +144,6 @@ async fn handle_message(
             state.db.log_query(user_id, "agent", &text, elapsed_ms, 0, 0);
 
             for chunk in split_message(&response, 4096) {
-                // Try markdown first, fallback to plain text
                 let md_result = bot
                     .send_message(msg.chat.id, &chunk)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -167,14 +173,17 @@ async fn handle_command(
     match text.split_whitespace().next().unwrap_or("") {
         "/start" => {
             let gmail_status = if state.config.gmail_creds.is_configured() {
-                "Gmail/Sheets: enabled"
-            } else {
-                "Gmail/Sheets: not configured"
-            };
+                "enabled" } else { "disabled" };
+            let sys_status = if state.config.enable_system_tools {
+                "enabled" } else { "disabled" };
             bot.send_message(
                 msg.chat.id,
                 format!(
-                    "Free Agent Bot\n\nProviders: {}\nTools: web, memory, datetime, gmail, sheets\n{gmail_status}\n\n/help for commands",
+                    "Free Agent Bot\n\n\
+                    Providers: {}\n\
+                    Gmail/Sheets: {gmail_status}\n\
+                    System tools (bash/read/write): {sys_status}\n\n\
+                    /help for commands",
                     state.pool.available_providers().join(", ")
                 ),
             )
@@ -215,6 +224,7 @@ async fn handle_command(
         }
         "/tools" => {
             let gmail_ok = state.config.gmail_creds.is_configured();
+            let sys_ok = state.config.enable_system_tools;
             let mut tools = vec![
                 "web_search — Search the web",
                 "web_fetch — Fetch URL content",
@@ -224,6 +234,15 @@ async fn handle_command(
                 "memory_delete — Delete a fact",
                 "get_datetime — Current date/time",
             ];
+            if sys_ok {
+                tools.extend(&[
+                    "bash — Execute shell commands",
+                    "read — Read file contents",
+                    "write — Write/create files",
+                    "glob — Find files by pattern",
+                    "grep — Search file contents",
+                ]);
+            }
             if gmail_ok {
                 tools.extend(&[
                     "gmail_search — Search emails",
