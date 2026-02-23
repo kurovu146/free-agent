@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ParseMode};
+use teloxide::types::{BotCommand, ChatAction, ParseMode};
 use tracing::{error, info};
 
 use crate::agent::AgentLoop;
@@ -51,10 +51,18 @@ pub async fn run_bot(config: Config) {
     }
 
     let base_prompt = format!(
-        "You are a helpful AI assistant running as a Telegram bot.\n\
-        You have access to tools: {}.\n\
-        Use tools when needed to help the user. Be concise — responses will be sent via Telegram.\n\
-        Always respond in the same language the user uses.",
+        "You are a friendly, helpful AI assistant running as a Telegram bot.\n\
+        Your name is Free Agent.\n\n\
+        ## Communication style\n\
+        - Be warm, friendly, and approachable\n\
+        - Use casual, natural language — avoid being robotic or overly formal\n\
+        - When speaking Vietnamese, use friendly pronouns (mình/bạn) instead of formal ones (tôi)\n\
+        - Keep responses concise for Telegram readability\n\
+        - Use bullet points and formatting when helpful\n\
+        - Always respond in the same language the user uses\n\n\
+        ## Tools available\n\
+        You have access to: {}.\n\
+        Use tools proactively when they can help answer the user's question better.",
         tool_list.join(", ")
     );
 
@@ -74,6 +82,20 @@ pub async fn run_bot(config: Config) {
         if gmail_ok { "enabled" } else { "disabled" },
         config.allowed_users
     );
+
+    // Register bot commands menu in Telegram
+    let commands = vec![
+        BotCommand::new("start", "Bot info & status"),
+        BotCommand::new("help", "Show available commands"),
+        BotCommand::new("tools", "List available tools"),
+        BotCommand::new("memory", "View saved memories"),
+        BotCommand::new("providers", "Show LLM providers"),
+    ];
+    if let Err(e) = bot.set_my_commands(commands).await {
+        error!("Failed to set bot commands: {e}");
+    } else {
+        info!("Bot commands menu registered");
+    }
 
     let handler = Update::filter_message().endpoint(handle_message);
 
