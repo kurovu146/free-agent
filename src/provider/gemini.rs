@@ -70,22 +70,42 @@ pub fn build_oai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     messages
         .iter()
         .map(|m| {
-            let role = match m.role {
-                Role::System => "system",
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::Tool => "tool",
-            };
             match &m.content {
-                MessageContent::Text(text) => json!({
-                    "role": role,
-                    "content": text,
-                }),
-                MessageContent::ToolResult { tool_call_id, content } => json!({
+                MessageContent::Text(text) => {
+                    let role = match m.role {
+                        Role::System => "system",
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                    };
+                    json!({
+                        "role": role,
+                        "content": text,
+                    })
+                }
+                MessageContent::ToolResult { tool_call_id, name, content } => json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
+                    "name": name,
                     "content": content,
                 }),
+                MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                    let mut msg = json!({
+                        "role": "assistant",
+                        "tool_calls": tool_calls.iter().map(|tc| json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            }
+                        })).collect::<Vec<_>>(),
+                    });
+                    if let Some(t) = text {
+                        msg["content"] = json!(t);
+                    }
+                    msg
+                }
             }
         })
         .collect()

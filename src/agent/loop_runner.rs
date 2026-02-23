@@ -59,9 +59,10 @@ impl AgentLoop {
             // Add assistant message with tool calls to history
             messages.push(Message {
                 role: Role::Assistant,
-                content: MessageContent::Text(
-                    response.content.clone().unwrap_or_default(),
-                ),
+                content: MessageContent::AssistantWithToolCalls {
+                    text: response.content.clone(),
+                    tool_calls: response.tool_calls.clone(),
+                },
             });
 
             // Execute each tool call and add results
@@ -83,6 +84,7 @@ impl AgentLoop {
                     role: Role::Tool,
                     content: MessageContent::ToolResult {
                         tool_call_id: tc.id.clone(),
+                        name: tc.function.name.clone(),
                         content: result,
                     },
                 });

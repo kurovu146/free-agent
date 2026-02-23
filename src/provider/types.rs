@@ -20,7 +20,15 @@ pub enum Role {
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
-    ToolResult { tool_call_id: String, content: String },
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        content: String,
+    },
+    AssistantWithToolCalls {
+        text: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
 }
 
 impl MessageContent {
@@ -28,6 +36,9 @@ impl MessageContent {
         match self {
             MessageContent::Text(s) => s,
             MessageContent::ToolResult { content, .. } => content,
+            MessageContent::AssistantWithToolCalls { text, .. } => {
+                text.as_deref().unwrap_or("")
+            }
         }
     }
 }
@@ -48,13 +59,13 @@ pub struct FunctionDef {
 }
 
 /// A tool call returned by the LLM
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub function: ToolCallFunction,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallFunction {
     pub name: String,
     pub arguments: String,
