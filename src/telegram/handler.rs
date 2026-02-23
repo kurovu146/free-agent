@@ -1,13 +1,16 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatAction, ParseMode};
 use tracing::{error, info};
 
-use crate::agent::AgentLoop;
+use crate::agent::{AgentLoop, AgentProgress};
 use crate::config::Config;
 use crate::db::Database;
 use crate::provider::ProviderPool;
 use crate::skills;
+
+use super::formatter;
 
 struct AppState {
     pool: ProviderPool,
@@ -52,14 +55,25 @@ pub async fn run_bot(config: Config) {
 
     let base_prompt = format!(
         "You are a friendly, helpful AI assistant running as a Telegram bot.\n\
-        Your name is Free Agent.\n\n\
+        Your name is KuroFree.\n\n\
         ## Communication style\n\
         - Be warm, friendly, and approachable\n\
         - Use casual, natural language — avoid being robotic or overly formal\n\
-        - When speaking Vietnamese, use friendly pronouns (mình/bạn) instead of formal ones (tôi)\n\
+        - When speaking Vietnamese, use anh/em pronouns (anh is the user, em is you). NEVER use mình/bạn/tôi\n\
         - Keep responses concise for Telegram readability\n\
         - Use bullet points and formatting when helpful\n\
         - Always respond in the same language the user uses\n\n\
+        ## Memory Management — CRITICAL\n\
+        You have a long-term memory system that persists across conversations.\n\
+        ALWAYS call memory_search at the START of each conversation to recall known facts about the user.\n\
+        You MUST call memory_save IMMEDIATELY when the user shares ANY of the following:\n\
+        - Their name, nickname, or how they want to be called\n\
+        - Personal preferences, interests, or habits\n\
+        - Technical details: projects, tools, tech stack\n\
+        - Decisions, plans, or goals\n\
+        - Any fact they explicitly ask you to remember\n\
+        - Important context about their work or life\n\
+        Do NOT wait — save the fact as soon as you see it in the message.\n\n\
         ## Tools available\n\
         You have access to: {}.\n\
         Use tools proactively when they can help answer the user's question better.",
@@ -106,6 +120,21 @@ pub async fn run_bot(config: Config) {
         .await;
 }
 
+/// Edit a Telegram message, trying Markdown first then falling back to plain text.
+async fn safe_edit(bot: &Bot, chat_id: ChatId, msg_id: i32, text: &str) {
+    // Try Markdown first (legacy mode — simpler than MarkdownV2)
+    #[allow(deprecated)]
+    let md_result = bot
+        .edit_message_text(chat_id, teloxide::types::MessageId(msg_id), text)
+        .parse_mode(ParseMode::Markdown)
+        .await;
+    if md_result.is_err() {
+        let _ = bot
+            .edit_message_text(chat_id, teloxide::types::MessageId(msg_id), text)
+            .await;
+    }
+}
+
 async fn handle_message(
     msg: teloxide::types::Message,
     bot: Bot,
@@ -132,8 +161,53 @@ async fn handle_message(
         return handle_command(&msg, &bot, &state, &text, user_id).await;
     }
 
-    // Typing indicator
+    // Send initial progress message
     let _ = bot.send_chat_action(msg.chat.id, ChatAction::Typing).await;
+    let progress_msg = bot
+        .send_message(msg.chat.id, "⏳ Đang xử lý...")
+        .await?;
+    let progress_msg_id = progress_msg.id.0;
+
+    // Typing indicator loop
+    let bot_typing = bot.clone();
+    let chat_id = msg.chat.id;
+    let typing_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let typing_flag = typing_active.clone();
+    let typing_handle = tokio::spawn(async move {
+        while typing_flag.load(Ordering::Relaxed) {
+            let _ = bot_typing.send_chat_action(chat_id, ChatAction::Typing).await;
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        }
+    });
+
+    // Progress callback: edit the progress message when tools are used
+    let bot_progress = bot.clone();
+    let progress_chat_id = msg.chat.id;
+    let last_edit = Arc::new(AtomicI64::new(0));
+
+    let on_progress = move |progress: AgentProgress| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let prev = last_edit.load(Ordering::Relaxed);
+
+        // Throttle: at least 1.5s between edits
+        if now - prev < 1500 {
+            return;
+        }
+
+        let display_text = match &progress {
+            AgentProgress::ToolUse(name) => formatter::format_progress(name),
+            AgentProgress::Thinking => "⏳ Đang suy nghĩ...".to_string(),
+        };
+
+        last_edit.store(now, Ordering::Relaxed);
+        let bot_inner = bot_progress.clone();
+        let _ = tokio::task::spawn(async move {
+            safe_edit(&bot_inner, progress_chat_id, progress_msg_id, &display_text).await;
+        });
+    };
 
     // Build system prompt with memory
     let memory_ctx = state.db.build_memory_context(user_id);
@@ -156,29 +230,46 @@ async fn handle_message(
         &state.config.working_dir,
         state.config.bash_timeout,
         state.config.max_agent_turns,
+        on_progress,
     )
     .await;
 
-    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let elapsed_secs = start.elapsed().as_secs_f64();
+
+    // Stop typing indicator
+    typing_active.store(false, Ordering::Relaxed);
+    typing_handle.abort();
 
     match result {
-        Ok(response) => {
-            state.db.log_query(user_id, "agent", &text, elapsed_ms, 0, 0);
+        Ok(agent_result) => {
+            state.db.log_query(user_id, &agent_result.provider, &text, start.elapsed().as_millis() as u64, 0, 0);
 
-            for chunk in split_message(&response, 4096) {
+            // Build final response with footer
+            let footer = formatter::format_tools_footer(&agent_result.tools_used, elapsed_secs);
+            let full_response = format!("{}{footer}", agent_result.response);
+
+            let chunks = formatter::split_message(&full_response, 4096);
+
+            // Edit the first chunk into the progress message
+            if let Some(first) = chunks.first() {
+                safe_edit(&bot, msg.chat.id, progress_msg_id, first).await;
+            }
+
+            // Send remaining chunks as new messages
+            for chunk in chunks.iter().skip(1) {
+                #[allow(deprecated)]
                 let md_result = bot
-                    .send_message(msg.chat.id, &chunk)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .send_message(msg.chat.id, chunk)
+                    .parse_mode(ParseMode::Markdown)
                     .await;
-
                 if md_result.is_err() {
-                    let _ = bot.send_message(msg.chat.id, &chunk).await;
+                    let _ = bot.send_message(msg.chat.id, chunk).await;
                 }
             }
         }
         Err(err) => {
             error!("Agent error: {err}");
-            bot.send_message(msg.chat.id, format!("Error: {err}")).await?;
+            safe_edit(&bot, msg.chat.id, progress_msg_id, &format!("❌ Error: {err}")).await;
         }
     }
 
@@ -201,7 +292,7 @@ async fn handle_command(
             bot.send_message(
                 msg.chat.id,
                 format!(
-                    "Free Agent Bot\n\n\
+                    "KuroFree Bot\n\n\
                     Providers: {}\n\
                     Gmail/Sheets: {gmail_status}\n\
                     System tools (bash/read/write): {sys_status}\n\n\
@@ -232,7 +323,7 @@ async fn handle_command(
                     .map(|(id, fact, cat)| format!("[{id}] [{cat}] {fact}"))
                     .collect::<Vec<_>>()
                     .join("\n");
-                for chunk in split_message(&output, 4096) {
+                for chunk in formatter::split_message(&output, 4096) {
                     bot.send_message(msg.chat.id, &chunk).await?;
                 }
             }
@@ -289,29 +380,4 @@ async fn handle_command(
         }
     }
     Ok(())
-}
-
-fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-
-    while !remaining.is_empty() {
-        if remaining.len() <= max_len {
-            chunks.push(remaining.to_string());
-            break;
-        }
-
-        let split_at = remaining[..max_len]
-            .rfind('\n')
-            .unwrap_or_else(|| remaining[..max_len].rfind(' ').unwrap_or(max_len));
-
-        chunks.push(remaining[..split_at].to_string());
-        remaining = remaining[split_at..].trim_start();
-    }
-
-    chunks
 }
