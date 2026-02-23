@@ -28,7 +28,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        dotenvy::dotenv().ok();
+        dotenvy::dotenv_override().ok();
 
         Self {
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
