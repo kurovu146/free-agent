@@ -17,8 +17,12 @@ pub enum AgentProgress {
 /// Result of an agent loop execution.
 pub struct AgentResult {
     pub response: String,
+    /// Deduplicated list of tools used.
     pub tools_used: Vec<String>,
+    /// Counts for each tool (parallel to tools_used).
+    pub tools_count: Vec<usize>,
     pub provider: String,
+    pub turns: usize,
 }
 
 pub struct AgentLoop;
@@ -38,6 +42,7 @@ impl AgentLoop {
         bash_timeout: u64,
         max_turns: usize,
         history: Vec<Message>,
+        preferred_provider: Option<&str>,
         on_progress: F,
     ) -> Result<AgentResult, String>
     where
@@ -62,10 +67,11 @@ impl AgentLoop {
             debug!("Agent turn {}/{}", turn + 1, max_turns);
             on_progress(AgentProgress::Thinking);
 
-            let (response, provider_name) = pool
-                .chat(&messages, &tools)
-                .await
-                .map_err(|e| format!("LLM error: {e}"))?;
+            let (response, provider_name) = match preferred_provider {
+                Some(name) => pool.chat_with_provider(&messages, &tools, name).await,
+                None => pool.chat(&messages, &tools).await,
+            }
+            .map_err(|e| format!("LLM error: {e}"))?;
 
             last_provider = provider_name;
 
@@ -79,13 +85,13 @@ impl AgentLoop {
                     response.usage.prompt_tokens,
                     response.usage.completion_tokens
                 );
-                // Deduplicate tools
-                tools_used.sort();
-                tools_used.dedup();
+                let (deduped, counts) = dedup_with_counts(&tools_used);
                 return Ok(AgentResult {
                     response: content,
-                    tools_used,
+                    tools_used: deduped,
+                    tools_count: counts,
                     provider: last_provider,
+                    turns: turn + 1,
                 });
             }
 
@@ -137,12 +143,25 @@ impl AgentLoop {
             .map(|m| m.content.as_text().to_string())
             .unwrap_or_else(|| "Reached max processing limit. Please try again.".into());
 
-        tools_used.sort();
-        tools_used.dedup();
+        let (deduped, counts) = dedup_with_counts(&tools_used);
         Ok(AgentResult {
             response: last_assistant,
-            tools_used,
+            tools_used: deduped,
+            tools_count: counts,
             provider: last_provider,
+            turns: max_turns,
         })
     }
+}
+
+/// Deduplicate a list of tool names while counting occurrences.
+fn dedup_with_counts(tools: &[String]) -> (Vec<String>, Vec<usize>) {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for t in tools {
+        *counts.entry(t.as_str()).or_default() += 1;
+    }
+    let names: Vec<String> = counts.keys().map(|k| k.to_string()).collect();
+    let cnts: Vec<usize> = counts.values().copied().collect();
+    (names, cnts)
 }

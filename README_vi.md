@@ -6,20 +6,22 @@ Viết bằng Rust, tối ưu tài nguyên (~5-15MB RAM, binary ~7MB).
 
 ## Tính năng
 
-- **Đa provider**: Gemini 2.0 Flash Thinking, Groq DeepSeek R1, Mistral Small
-- **Xoay vòng key**: Nhiều API key mỗi provider, tự động luân phiên để tránh rate limit
+- **Đa provider**: Gemini 2.5 Flash, Groq Llama 3.3 70B, Mistral Small, Claude (tùy chọn)
+- **Xoay vòng key thông minh**: Nhiều API key mỗi provider, luân phiên tự động; thử tất cả key trước khi chuyển provider
 - **Tự động fallback**: Nếu một provider lỗi hoặc rate limit, chuyển sang provider tiếp theo
 - **Agent loop**: LLM gọi tool, nhận kết quả, gọi tiếp — tối đa N lượt mỗi tin nhắn
 - **Lịch sử hội thoại**: Lưu 10 cặp tin nhắn gần nhất mỗi phiên hội thoại (SQLite)
-- **Công cụ (Tools)**:
+- **Công cụ (19+ tools)**:
   - Tìm kiếm web (DuckDuckGo) + đọc nội dung URL
   - Bộ nhớ dài hạn mỗi user (SQLite với FTS5 tìm kiếm toàn văn)
+  - Plan & Todo: lập kế hoạch và quản lý task liên tục
   - System tools: bash, đọc/ghi file, glob, grep (cần bật)
   - Gmail & Google Sheets (cần bật, yêu cầu OAuth2)
   - Ngày giờ hiện tại
 - **Skills system**: File markdown trong `skills/` tự động inject vào system prompt
 - **Streaming UX**: Cập nhật tiến trình thời gian thực — hiển thị tool đang chạy
-- **Footer tools**: Mỗi phản hồi hiển thị tool đã dùng và thời gian xử lý
+- **Footer tools**: Mỗi phản hồi hiển thị tool đã dùng, số lần gọi, số turns, và thời gian xử lý
+- **Chống ảo giác**: Phát hiện và cảnh báo khi model bịa kết quả tool
 - **An toàn UTF-8**: Xử lý Unicode đúng khi chia nhỏ tin nhắn (CJK, emoji, tiếng Việt)
 
 ## Bắt đầu nhanh
@@ -59,7 +61,8 @@ cargo build --release
 | `GEMINI_API_KEYS` | Không* | Các Gemini API key (cách nhau bởi dấu phẩy) |
 | `GROQ_API_KEYS` | Không* | Các Groq API key (cách nhau bởi dấu phẩy) |
 | `MISTRAL_API_KEYS` | Không* | Các Mistral API key (cách nhau bởi dấu phẩy) |
-| `DEFAULT_PROVIDER` | Không | `gemini` (mặc định), `groq`, hoặc `mistral` |
+| `CLAUDE_API_KEYS` | Không* | Các Anthropic API key (cách nhau bởi dấu phẩy) |
+| `DEFAULT_PROVIDER` | Không | `gemini` (mặc định), `groq`, `mistral`, hoặc `claude` |
 | `MAX_AGENT_TURNS` | Không | Số lượt tối đa gọi tool mỗi tin nhắn (mặc định: 10) |
 | `ENABLE_SYSTEM_TOOLS` | Không | Bật bash/read/write/glob/grep (mặc định: false) |
 | `WORKING_DIR` | Không | Thư mục làm việc cho system tools (mặc định: `.`) |
@@ -82,6 +85,13 @@ cargo build --release
 | `memory_list` | Liệt kê tất cả thông tin đã lưu | Luôn có |
 | `memory_delete` | Xóa thông tin đã lưu | Luôn có |
 | `get_datetime` | Lấy ngày giờ hiện tại | Luôn có |
+| `plan_read` | Đọc plan hiện tại | Luôn có |
+| `plan_write` | Viết/cập nhật plan | Luôn có |
+| `todo_add` | Thêm todo item mới | Luôn có |
+| `todo_list` | Liệt kê tất cả todos | Luôn có |
+| `todo_update` | Cập nhật trạng thái todo (pending/in_progress/completed) | Luôn có |
+| `todo_delete` | Xóa todo item | Luôn có |
+| `todo_clear_completed` | Xóa tất cả todo đã hoàn thành | Luôn có |
 | `bash` | Thực thi lệnh shell | System Tools |
 | `read` | Đọc nội dung file | System Tools |
 | `write` | Ghi/tạo file | System Tools |
@@ -128,9 +138,10 @@ Telegram Handler
   ▼
 Agent Loop (tối đa N lượt)
   ├── Gọi LLM ──► Provider Pool (xoay vòng + fallback)
-  │                  ├── Gemini 2.0 Flash Thinking
-  │                  ├── Groq DeepSeek R1 Distill Llama 70B
-  │                  └── Mistral Small
+  │                  ├── Gemini 2.5 Flash (keys: k1, k2, k3, k4...)
+  │                  ├── Groq Llama 3.3 70B (keys: k1, k2...)
+  │                  ├── Mistral Small (keys: k1...)
+  │                  └── Claude Sonnet (tùy chọn, keys: k1...)
   │
   ├── LLM trả về tool calls?
   │     ├── Có → Thực thi tools → Cập nhật tin nhắn tiến trình → Lặp lại
@@ -151,10 +162,11 @@ src/
 │   ├── loop_runner.rs   # Agent loop với injection lịch sử + progress callback
 │   └── tool_registry.rs # Định nghĩa tool + dispatch
 ├── provider/
-│   ├── pool.rs          # Round-robin pool với fallback
-│   ├── gemini.rs        # Gemini 2.0 Flash Thinking (OpenAI-compatible)
-│   ├── groq.rs          # Groq DeepSeek R1 (OpenAI-compatible)
+│   ├── pool.rs          # Round-robin pool với retry từng key + fallback
+│   ├── gemini.rs        # Gemini 2.5 Flash (OpenAI-compatible)
+│   ├── groq.rs          # Groq Llama 3.3 70B (OpenAI-compatible)
 │   ├── mistral.rs       # Mistral Small (OpenAI-compatible)
+│   ├── claude.rs        # Claude Sonnet (Anthropic API)
 │   └── types.rs         # Các kiểu dùng chung (Message, ToolCall, v.v.)
 ├── telegram/
 │   ├── handler.rs       # Xử lý tin nhắn + lịch sử session + streaming UX
@@ -162,12 +174,13 @@ src/
 ├── tools/
 │   ├── web.rs           # web_search + web_fetch
 │   ├── memory.rs        # memory_save/search/list/delete
+│   ├── planning.rs      # plan_read/write + todo_add/list/update/delete
 │   ├── datetime.rs      # get_datetime
 │   ├── system.rs        # bash/read/write/glob/grep
 │   ├── gmail.rs         # Các tool Gmail API
 │   └── sheets.rs        # Các tool Google Sheets API
 ├── db/
-│   └── mod.rs           # SQLite: memory (FTS5), sessions, lịch sử hội thoại, query logs
+│   └── mod.rs           # SQLite: memory (FTS5), sessions, plans, todos, query logs
 └── skills/
     └── mod.rs           # Tải file .md từ thư mục skills/
 ```
@@ -178,9 +191,12 @@ src/
 |------|-------|
 | `/start` | Thông tin & trạng thái bot |
 | `/help` | Hiển thị các lệnh khả dụng |
+| `/new` | Bắt đầu hội thoại mới (xóa lịch sử) |
 | `/tools` | Liệt kê các tool khả dụng |
 | `/memory` | Liệt kê thông tin đã lưu |
 | `/providers` | Hiển thị các LLM provider |
+
+**Chọn provider**: Thêm `dùng claude`, `use gemini`, v.v. trước tin nhắn để chọn provider cho 1 tin nhắn.
 
 ## Tài nguyên sử dụng
 

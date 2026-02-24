@@ -12,7 +12,7 @@ impl GeminiProvider {
     pub fn new() -> Self {
         Self {
             client: Client::new(),
-            model: "gemini-2.5-flash-preview-05-20".into(),
+            model: "gemini-2.5-flash".into(),
         }
     }
 }
@@ -37,6 +37,7 @@ impl GeminiProvider {
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)
                 .map_err(|e| ProviderError::ParseError(e.to_string()))?;
+            body["tool_choice"] = json!("auto");
         }
 
         let resp = self

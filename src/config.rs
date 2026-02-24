@@ -8,6 +8,7 @@ pub struct Config {
     pub allowed_users: Vec<u64>,
 
     // Provider keys (multiple per provider for round-robin)
+    pub claude_keys: Vec<String>,
     pub gemini_keys: Vec<String>,
     pub groq_keys: Vec<String>,
     pub mistral_keys: Vec<String>,
@@ -28,7 +29,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        dotenvy::from_path("/home/kuro/dev/free-agent/.env").ok();
+        dotenvy::from_path_override("/home/kuro/dev/free-agent/.env").ok();
 
         Self {
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
@@ -39,6 +40,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .filter_map(|s| s.trim().parse().ok())
                 .collect(),
+            claude_keys: parse_keys("CLAUDE_API_KEYS"),
             gemini_keys: parse_keys("GEMINI_API_KEYS"),
             groq_keys: parse_keys("GROQ_API_KEYS"),
             mistral_keys: parse_keys("MISTRAL_API_KEYS"),

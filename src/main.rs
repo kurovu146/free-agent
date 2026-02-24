@@ -23,7 +23,8 @@ async fn main() {
 
     tracing::info!("Free Agent v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!(
-        "Providers: gemini={}, groq={}, mistral={}",
+        "Providers: claude={}, gemini={}, groq={}, mistral={}",
+        config.claude_keys.len(),
         config.gemini_keys.len(),
         config.groq_keys.len(),
         config.mistral_keys.len()

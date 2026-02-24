@@ -33,6 +33,7 @@ impl GroqProvider {
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)
                 .map_err(|e| ProviderError::ParseError(e.to_string()))?;
+            body["tool_choice"] = json!("auto");
         }
 
         let resp = self

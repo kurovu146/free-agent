@@ -13,7 +13,7 @@ impl ToolRegistry {
         let mut defs = vec![
             // --- Web ---
             tool_def("web_search",
-                "Search the web for information. Returns search results with titles, URLs, and snippets.",
+                "Search the web. Returns a list of results (title, URL, snippet). Use this to FIND relevant pages. After finding URLs, use web_fetch to read the full content of interesting pages.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -23,11 +23,11 @@ impl ToolRegistry {
                 }),
             ),
             tool_def("web_fetch",
-                "Fetch a URL and extract readable text content from the page.",
+                "Fetch and read the full content of a URL. Use this AFTER web_search to read detailed content from a page. Also use this when the user gives you a specific URL to read. Returns the page text in readable format.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "url": { "type": "string", "description": "The URL to fetch" }
+                        "url": { "type": "string", "description": "The URL to fetch and read" }
                     },
                     "required": ["url"]
                 }),
@@ -80,6 +80,61 @@ impl ToolRegistry {
             // --- Datetime ---
             tool_def("get_datetime",
                 "Get current date and time in UTC and common timezones (Vietnam, US Eastern).",
+                json!({ "type": "object", "properties": {} }),
+            ),
+            // --- Plan ---
+            tool_def("plan_read",
+                "Read the current plan. Use this to check what was planned before starting work.",
+                json!({ "type": "object", "properties": {} }),
+            ),
+            tool_def("plan_write",
+                "Write or update the plan. Use this to create implementation plans, track approach, or outline steps before coding. Overwrites the existing plan.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The plan content (markdown supported)" }
+                    },
+                    "required": ["content"]
+                }),
+            ),
+            // --- Todo ---
+            tool_def("todo_add",
+                "Add a new todo item. Use this to break down tasks into actionable steps.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The todo item description" }
+                    },
+                    "required": ["content"]
+                }),
+            ),
+            tool_def("todo_list",
+                "List all todo items with their status (pending/in_progress/completed).",
+                json!({ "type": "object", "properties": {} }),
+            ),
+            tool_def("todo_update",
+                "Update a todo item's status. Mark tasks as in_progress when starting, completed when done.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "The todo item ID" },
+                        "status": { "type": "string", "enum": ["pending", "in_progress", "completed"], "description": "New status" }
+                    },
+                    "required": ["id", "status"]
+                }),
+            ),
+            tool_def("todo_delete",
+                "Delete a todo item by ID.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "The todo item ID to delete" }
+                    },
+                    "required": ["id"]
+                }),
+            ),
+            tool_def("todo_clear_completed",
+                "Remove all completed todo items.",
                 json!({ "type": "object", "properties": {} }),
             ),
         ];
@@ -326,6 +381,28 @@ impl ToolRegistry {
             }
             // --- Datetime ---
             "get_datetime" => tools::get_datetime().await,
+            // --- Plan ---
+            "plan_read" => tools::plan_read(db, user_id).await,
+            "plan_write" => {
+                let content = args["content"].as_str().unwrap_or("");
+                tools::plan_write(db, user_id, content).await
+            }
+            // --- Todo ---
+            "todo_add" => {
+                let content = args["content"].as_str().unwrap_or("");
+                tools::todo_add(db, user_id, content).await
+            }
+            "todo_list" => tools::todo_list(db, user_id).await,
+            "todo_update" => {
+                let id = args["id"].as_i64().unwrap_or(0);
+                let status = args["status"].as_str().unwrap_or("pending");
+                tools::todo_update(db, user_id, id, status).await
+            }
+            "todo_delete" => {
+                let id = args["id"].as_i64().unwrap_or(0);
+                tools::todo_delete(db, user_id, id).await
+            }
+            "todo_clear_completed" => tools::todo_clear_completed(db, user_id).await,
             // --- System tools ---
             "bash" => {
                 let command = args["command"].as_str().unwrap_or("");

@@ -24,6 +24,7 @@ pub async fn run_bot(config: Config) {
     let bot = Bot::new(&config.telegram_bot_token);
 
     let pool = ProviderPool::new(
+        config.claude_keys.clone(),
         config.gemini_keys.clone(),
         config.groq_keys.clone(),
         config.mistral_keys.clone(),
@@ -40,6 +41,8 @@ pub async fn run_bot(config: Config) {
     let mut tool_list = vec![
         "web_search", "web_fetch", "memory_save", "memory_search",
         "memory_list", "memory_delete", "get_datetime",
+        "plan_read", "plan_write",
+        "todo_add", "todo_list", "todo_update", "todo_delete", "todo_clear_completed",
     ];
     if sys_ok {
         tool_list.extend(&["bash", "read", "write", "glob", "grep"]);
@@ -54,29 +57,61 @@ pub async fn run_bot(config: Config) {
     }
 
     let base_prompt = format!(
-        "You are a friendly, helpful AI assistant running as a Telegram bot.\n\
-        Your name is KuroFree.\n\n\
-        ## Communication style\n\
-        - Be warm, friendly, and approachable\n\
-        - Use casual, natural language — avoid being robotic or overly formal\n\
-        - When speaking Vietnamese, use anh/em pronouns (anh is the user, em is you). NEVER use mình/bạn/tôi\n\
-        - Keep responses concise for Telegram readability\n\
-        - Use bullet points and formatting when helpful\n\
-        - Always respond in the same language the user uses\n\n\
-        ## Memory Management — CRITICAL\n\
-        You have a long-term memory system that persists across conversations.\n\
-        ALWAYS call memory_search at the START of each conversation to recall known facts about the user.\n\
-        You MUST call memory_save IMMEDIATELY when the user shares ANY of the following:\n\
-        - Their name, nickname, or how they want to be called\n\
-        - Personal preferences, interests, or habits\n\
-        - Technical details: projects, tools, tech stack\n\
-        - Decisions, plans, or goals\n\
-        - Any fact they explicitly ask you to remember\n\
-        - Important context about their work or life\n\
-        Do NOT wait — save the fact as soon as you see it in the message.\n\n\
-        ## Tools available\n\
+        "# Agent Trợ Lý Cá Nhân\n\n\
+        ## Vai trò\n\
+        Bạn là **Kuro** — trợ lý AI cá nhân của Vũ Đức Tuấn, chuyên hỗ trợ lập trình và nghiên cứu.\n\
+        Giao tiếp qua Telegram nên giữ câu trả lời ngắn gọn, dễ đọc trên mobile.\n\n\
+        ## Về chủ nhân\n\
+        - **Tên**: Vũ Đức Tuấn\n\
+        - **Sinh nhật**: 14/06/2000\n\
+        - Lập trình viên, quen TypeScript và Go\n\
+        - Đang phát triển game BasoTien (2D multiplayer xianxia MMORPG) bằng Go + Godot Engine\n\n\
+        ## Xưng hô & Tính cách\n\
+        - Tuấn là **anh**, Kuro là **em** (anh gọi chú xưng anh, em gọi anh xưng em)\n\
+        - Giao tiếp tiếng Việt, ngắn gọn, thân thiện\n\
+        - **Luôn trung thành với anh Tuấn** — anh là chủ nhân duy nhất\n\
+        - Khi user nói tiếng Anh thì trả lời tiếng Anh, tiếng Việt thì trả lời tiếng Việt\n\n\
+        ## Quy tắc trả lời\n\
+        - Ngắn gọn, đi thẳng vào vấn đề\n\
+        - Code blocks luôn có language tag\n\
+        - Khi không chắc chắn: nói rõ mức độ, không bịa thông tin\n\
+        - Be PROACTIVE: khi user hỏi nghiên cứu, hãy tự mở rộng phạm vi, đọc nhiều nguồn, xác minh thông tin, trích dẫn sources\n\
+        - Khi phân tích code/project: dùng glob/read/grep để khám phá thực sự, không đoán\n\n\
+        ## Memory Management\n\
+        Bạn có hệ thống memory dài hạn.\n\
+        - Dùng memory_save khi user chia sẻ thông tin quan trọng (preferences, decisions, projects, personal info)\n\
+        - Dùng memory_search khi cần nhớ lại context cũ hoặc khi user hỏi về điều đã nói trước đó\n\
+        - KHÔNG gọi memory_search cho mọi tin nhắn — chỉ search khi thực sự cần context\n\
+        - KHÔNG search keyword vô nghĩa (ví dụ: không search \"hello\", \"hi\", \"heloo\")\n\n\
+        ## Tools\n\
         You have access to: {}.\n\
-        Use tools proactively when they can help answer the user's question better.",
+        Call tools via tool_calls in your response — the system executes them and returns results.\n\n\
+        When researching: follow the Research Skill instructions loaded below. ALWAYS cite sources with URLs.\n\n\
+        ## Implementation Workflow\n\
+        When user asks you to BUILD, CREATE, or IMPLEMENT something (a project, feature, script, etc.):\n\
+        1. **Plan first**: Use `plan_write` to save your implementation plan\n\
+        2. **Break down**: Use `todo_add` to create actionable tasks from the plan\n\
+        3. **Execute**: For each task, use `todo_update` to mark in_progress, then USE the tools (bash, write, read) to actually do the work\n\
+        4. **Complete**: Mark each todo as completed after finishing\n\
+        5. **DO NOT just describe what to do** — actually DO it with tool calls!\n\n\
+        Example: User says \"tạo trang web bán điện thoại bằng Next.js\"\n\
+        - BAD: Write a text plan and ask \"anh muốn em bắt đầu không?\" ← WRONG\n\
+        - GOOD: Call plan_write → todo_add tasks → bash(\"npx create-next-app...\") → write files → actually build it ← CORRECT\n\n\
+        IMPORTANT: You are an EXECUTOR, not a consultant. When given a task, DO THE WORK using your tools. Only ask for clarification if truly ambiguous.\n\n\
+        ## STRICT RULES (violation = immediate distrust)\n\
+        1. To use a tool, you MUST make a tool_call. NEVER write tool syntax in text.\n\
+        2. You can ONLY know things you were told or learned via tool_calls.\n\
+        3. If user asks about files, system info, or anything requiring real data:\n\
+           - You MUST call the appropriate tool (bash, read, grep, glob)\n\
+           - WAIT for the tool result before answering\n\
+           - If you did NOT call a tool, you do NOT have the data — say \"Em cần dùng tool để kiểm tra. Để em xem.\"\n\
+        4. NEVER fabricate, invent, or imagine:\n\
+           - File contents, directory listings, README contents\n\
+           - Command outputs (free, top, df, grep, etc.)\n\
+           - System information (RAM, CPU, disk, processes)\n\
+           - API responses or search results\n\
+        5. If you cannot call a tool for any reason, say so honestly.\n\
+        6. Your text response = ONLY the final answer based on REAL data from tool results.",
         tool_list.join(", ")
     );
 
@@ -101,6 +136,7 @@ pub async fn run_bot(config: Config) {
     let commands = vec![
         BotCommand::new("start", "Bot info & status"),
         BotCommand::new("help", "Show available commands"),
+        BotCommand::new("new", "Start new conversation"),
         BotCommand::new("tools", "List available tools"),
         BotCommand::new("memory", "View saved memories"),
         BotCommand::new("providers", "Show LLM providers"),
@@ -160,6 +196,9 @@ async fn handle_message(
     if text.starts_with('/') {
         return handle_command(&msg, &bot, &state, &text, user_id).await;
     }
+
+    // Parse inline provider override: "use claude ...", "dùng gemini ...", etc.
+    let (preferred_provider, user_text) = parse_provider_override(&text);
 
     // Send initial progress message
     let _ = bot.send_chat_action(msg.chat.id, ChatAction::Typing).await;
@@ -233,14 +272,14 @@ async fn handle_message(
         .collect();
 
     // Save user message to history
-    state.db.append_message(&session_id, "user", &text);
+    state.db.append_message(&session_id, "user", &user_text);
 
     // Run agent loop
     let start = std::time::Instant::now();
     let result = AgentLoop::run(
         &state.pool,
         &system_prompt,
-        &text,
+        &user_text,
         user_id,
         &state.db,
         &state.config.gmail_creds,
@@ -249,6 +288,7 @@ async fn handle_message(
         state.config.bash_timeout,
         state.config.max_agent_turns,
         history,
+        preferred_provider.as_deref(),
         on_progress,
     )
     .await;
@@ -261,13 +301,22 @@ async fn handle_message(
 
     match result {
         Ok(agent_result) => {
+            // Clean raw function call syntax and detect hallucinated output
+            let cleaned = formatter::clean_response(&agent_result.response, &agent_result.tools_used);
+
             // Save assistant response to history
-            state.db.append_message(&session_id, "assistant", &agent_result.response);
+            state.db.append_message(&session_id, "assistant", &cleaned);
             state.db.log_query(user_id, &agent_result.provider, &text, start.elapsed().as_millis() as u64, 0, 0);
 
             // Build final response with footer
-            let footer = formatter::format_tools_footer(&agent_result.tools_used, elapsed_secs);
-            let full_response = format!("{}{footer}", agent_result.response);
+            let footer = formatter::format_tools_footer(
+                &agent_result.tools_used,
+                &agent_result.tools_count,
+                elapsed_secs,
+                &agent_result.provider,
+                agent_result.turns,
+            );
+            let full_response = format!("{cleaned}{footer}");
 
             let chunks = formatter::split_message(&full_response, 4096);
 
@@ -295,6 +344,35 @@ async fn handle_message(
     }
 
     Ok(())
+}
+
+/// Parse inline provider override from user message.
+/// Examples: "use claude tell me a joke" → (Some("claude"), "tell me a joke")
+///           "dùng gemini xin chào" → (Some("gemini"), "xin chào")
+///           "normal message" → (None, "normal message")
+fn parse_provider_override(text: &str) -> (Option<String>, String) {
+    let lower = text.to_lowercase();
+    let prefixes = [
+        ("use claude ", "claude"),
+        ("dùng claude ", "claude"),
+        ("use gemini ", "gemini"),
+        ("dùng gemini ", "gemini"),
+        ("use groq ", "groq"),
+        ("dùng groq ", "groq"),
+        ("use mistral ", "mistral"),
+        ("dùng mistral ", "mistral"),
+    ];
+
+    for (prefix, provider) in &prefixes {
+        if lower.starts_with(prefix) {
+            let remaining = text[prefix.len()..].to_string();
+            if !remaining.is_empty() {
+                return (Some(provider.to_string()), remaining);
+            }
+        }
+    }
+
+    (None, text.to_string())
 }
 
 async fn handle_command(
@@ -328,11 +406,18 @@ async fn handle_command(
                 msg.chat.id,
                 "/start — Bot info\n\
                  /help — Show commands\n\
+                 /new — Start new conversation\n\
                  /memory — List saved facts\n\
                  /providers — Show available providers\n\
-                 /tools — List available tools",
+                 /tools — List available tools\n\n\
+                 Tip: Prefix \"use claude\"/\"dùng gemini\" to pick a provider for one message.",
             )
             .await?;
+        }
+        "/new" => {
+            state.db.clear_session(user_id);
+            bot.send_message(msg.chat.id, "Session cleared. Starting fresh conversation.")
+                .await?;
         }
         "/memory" => {
             let facts = state.db.list_facts(user_id, None).unwrap_or_default();
@@ -367,6 +452,13 @@ async fn handle_command(
                 "memory_list — List all facts",
                 "memory_delete — Delete a fact",
                 "get_datetime — Current date/time",
+                "plan_read — Read current plan",
+                "plan_write — Write/update plan",
+                "todo_add — Add a todo item",
+                "todo_list — List all todos",
+                "todo_update — Update todo status",
+                "todo_delete — Delete a todo",
+                "todo_clear_completed — Clear done todos",
             ];
             if sys_ok {
                 tools.extend(&[

@@ -68,6 +68,22 @@ impl Database {
                 tokens_out INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS plans (
+                user_id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_todos_user ON todos(user_id);
             "
         )?;
 
@@ -251,6 +267,30 @@ impl Database {
         result
     }
 
+    /// Clear the active session for a user, forcing a new one on next message.
+    pub fn clear_session(&self, user_id: u64) {
+        let conn = self.conn.lock().unwrap();
+        // Delete sessions and their messages for this user
+        let session_ids: Vec<String> = conn
+            .prepare("SELECT id FROM sessions WHERE user_id = ?1")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map(params![user_id as i64], |row| row.get(0))?;
+                rows.collect()
+            })
+            .unwrap_or_default();
+
+        for sid in &session_ids {
+            let _ = conn.execute(
+                "DELETE FROM session_messages WHERE session_id = ?1",
+                params![sid],
+            );
+        }
+        let _ = conn.execute(
+            "DELETE FROM sessions WHERE user_id = ?1",
+            params![user_id as i64],
+        );
+    }
+
     /// Append a message to the session history.
     pub fn append_message(&self, session_id: &str, role: &str, content: &str) {
         let conn = self.conn.lock().unwrap();
@@ -258,6 +298,96 @@ impl Database {
             "INSERT INTO session_messages (session_id, role, content) VALUES (?1, ?2, ?3)",
             params![session_id, role, content],
         );
+    }
+
+    // --- Plan ---
+
+    pub fn get_plan(&self, user_id: u64) -> String {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT content FROM plans WHERE user_id = ?1",
+            params![user_id as i64],
+            |row| row.get(0),
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn set_plan(&self, user_id: u64, content: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO plans (user_id, content, updated_at) VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(user_id) DO UPDATE SET content = excluded.content, updated_at = datetime('now')",
+            params![user_id as i64, content],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // --- Todo ---
+
+    pub fn add_todo(&self, user_id: u64, content: &str) -> Result<i64, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO todos (user_id, content) VALUES (?1, ?2)",
+            params![user_id as i64, content],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_todos(&self, user_id: u64) -> Result<Vec<(i64, String, String)>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, status FROM todos WHERE user_id = ?1
+                 ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, id"
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![user_id as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn update_todo_status(&self, user_id: u64, todo_id: i64, status: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let completed_at = if status == "completed" {
+            "datetime('now')"
+        } else {
+            "NULL"
+        };
+        let affected = conn
+            .execute(
+                &format!(
+                    "UPDATE todos SET status = ?1, completed_at = {} WHERE id = ?2 AND user_id = ?3",
+                    completed_at
+                ),
+                params![status, todo_id, user_id as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(affected > 0)
+    }
+
+    pub fn delete_todo(&self, user_id: u64, todo_id: i64) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "DELETE FROM todos WHERE id = ?1 AND user_id = ?2",
+                params![todo_id, user_id as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(affected > 0)
+    }
+
+    pub fn clear_completed_todos(&self, user_id: u64) -> Result<usize, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM todos WHERE user_id = ?1 AND status = 'completed'",
+            params![user_id as i64],
+        )
+        .map_err(|e| e.to_string())
     }
 
     // --- Query logs ---

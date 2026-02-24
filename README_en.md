@@ -6,20 +6,22 @@ Built in Rust for minimal resource usage (~5-15MB RAM, ~7MB binary).
 
 ## Features
 
-- **Multi-provider**: Gemini 2.0 Flash Thinking, Groq DeepSeek R1, Mistral Small
-- **Round-robin keys**: Multiple API keys per provider, auto-rotated to avoid rate limits
+- **Multi-provider**: Gemini 2.5 Flash, Groq Llama 3.3 70B, Mistral Small, Claude (optional)
+- **Smart key rotation**: Multiple API keys per provider with round-robin; retries all keys before falling back
 - **Auto-fallback**: If one provider hits rate limit or errors, seamlessly tries the next
 - **Agent loop**: LLM calls tools, gets results, calls again — up to N turns per message
 - **Conversation history**: Last 10 message pairs persisted per user session (SQLite)
-- **Tool calling**:
+- **Tool calling (19+ tools)**:
   - Web search (DuckDuckGo) + URL fetch
   - Persistent memory per user (SQLite with FTS5 full-text search)
+  - Plan & Todo: persistent implementation planning and task tracking
   - System tools: bash, file read/write, glob, grep (opt-in)
   - Gmail & Google Sheets (opt-in, requires OAuth2)
   - Date/time
 - **Skills system**: Markdown files in `skills/` injected into system prompt
 - **Streaming UX**: Real-time progress updates — shows which tool is running
-- **Tools footer**: Every response shows which tools were used and response time
+- **Tools footer**: Every response shows tools used, call counts, turns, and response time
+- **Anti-hallucination**: Detects and warns when model fabricates tool outputs
 - **UTF-8 safe**: Proper Unicode handling for message splitting (CJK, emoji, Vietnamese)
 
 ## Quick Start
@@ -59,7 +61,8 @@ cargo build --release
 | `GEMINI_API_KEYS` | No* | Comma-separated Gemini API keys |
 | `GROQ_API_KEYS` | No* | Comma-separated Groq API keys |
 | `MISTRAL_API_KEYS` | No* | Comma-separated Mistral API keys |
-| `DEFAULT_PROVIDER` | No | `gemini` (default), `groq`, or `mistral` |
+| `CLAUDE_API_KEYS` | No* | Comma-separated Anthropic API keys |
+| `DEFAULT_PROVIDER` | No | `gemini` (default), `groq`, `mistral`, or `claude` |
 | `MAX_AGENT_TURNS` | No | Max tool-call loops per message (default: 10) |
 | `ENABLE_SYSTEM_TOOLS` | No | Enable bash/read/write/glob/grep (default: false) |
 | `WORKING_DIR` | No | Working directory for system tools (default: `.`) |
@@ -82,6 +85,13 @@ cargo build --release
 | `memory_list` | List all saved facts | Always |
 | `memory_delete` | Delete a saved fact | Always |
 | `get_datetime` | Get current date/time | Always |
+| `plan_read` | Read the current implementation plan | Always |
+| `plan_write` | Write/update an implementation plan | Always |
+| `todo_add` | Add a new todo item | Always |
+| `todo_list` | List all todos with status | Always |
+| `todo_update` | Update todo status (pending/in_progress/completed) | Always |
+| `todo_delete` | Delete a todo item | Always |
+| `todo_clear_completed` | Remove all completed todos | Always |
 | `bash` | Execute shell commands | System Tools |
 | `read` | Read file contents | System Tools |
 | `write` | Write/create files | System Tools |
@@ -128,9 +138,10 @@ Telegram Handler
   ▼
 Agent Loop (max N turns)
   ├── Call LLM ──► Provider Pool (round-robin + fallback)
-  │                  ├── Gemini 2.0 Flash Thinking
-  │                  ├── Groq DeepSeek R1 Distill Llama 70B
-  │                  └── Mistral Small
+  │                  ├── Gemini 2.5 Flash (keys: k1, k2, k3, k4...)
+  │                  ├── Groq Llama 3.3 70B (keys: k1, k2...)
+  │                  ├── Mistral Small (keys: k1...)
+  │                  └── Claude Sonnet (optional, keys: k1...)
   │
   ├── LLM returns tool calls?
   │     ├── Yes → Execute tools → Update progress message → Loop
@@ -151,10 +162,11 @@ src/
 │   ├── loop_runner.rs   # Agent loop with history injection + progress callback
 │   └── tool_registry.rs # Tool definitions + dispatch
 ├── provider/
-│   ├── pool.rs          # Round-robin pool with fallback
-│   ├── gemini.rs        # Gemini 2.0 Flash Thinking (OpenAI-compatible)
-│   ├── groq.rs          # Groq DeepSeek R1 (OpenAI-compatible)
+│   ├── pool.rs          # Round-robin pool with per-key retry + fallback
+│   ├── gemini.rs        # Gemini 2.5 Flash (OpenAI-compatible)
+│   ├── groq.rs          # Groq Llama 3.3 70B (OpenAI-compatible)
 │   ├── mistral.rs       # Mistral Small (OpenAI-compatible)
+│   ├── claude.rs        # Claude Sonnet (Anthropic API)
 │   └── types.rs         # Shared types (Message, ToolCall, etc.)
 ├── telegram/
 │   ├── handler.rs       # Message handling + session history + streaming UX
@@ -162,12 +174,13 @@ src/
 ├── tools/
 │   ├── web.rs           # web_search + web_fetch
 │   ├── memory.rs        # memory_save/search/list/delete
+│   ├── planning.rs      # plan_read/write + todo_add/list/update/delete
 │   ├── datetime.rs      # get_datetime
 │   ├── system.rs        # bash/read/write/glob/grep
 │   ├── gmail.rs         # Gmail API tools
 │   └── sheets.rs        # Google Sheets API tools
 ├── db/
-│   └── mod.rs           # SQLite: memory (FTS5), sessions, conversation history, query logs
+│   └── mod.rs           # SQLite: memory (FTS5), sessions, plans, todos, query logs
 └── skills/
     └── mod.rs           # Load .md files from skills/ directory
 ```
@@ -178,9 +191,12 @@ src/
 |---------|-------------|
 | `/start` | Bot info & status |
 | `/help` | Show available commands |
+| `/new` | Start a new conversation (clear history) |
 | `/tools` | List available tools |
 | `/memory` | List saved facts |
 | `/providers` | Show LLM providers |
+
+**Provider override**: Prefix your message with `use claude`, `use gemini`, etc. to pick a specific provider for one message.
 
 ## Resource Usage
 
