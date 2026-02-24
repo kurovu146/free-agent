@@ -195,6 +195,71 @@ impl Database {
         Ok(affected > 0)
     }
 
+    // --- Conversation history ---
+
+    /// Get or create the active session for a user. Returns session_id.
+    pub fn get_or_create_session(&self, user_id: u64) -> String {
+        let conn = self.conn.lock().unwrap();
+        // Try to find existing session (most recent)
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM sessions WHERE user_id = ?1 ORDER BY last_active_at DESC LIMIT 1",
+                params![user_id as i64],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing {
+            // Update last_active_at
+            let _ = conn.execute(
+                "UPDATE sessions SET last_active_at = datetime('now') WHERE id = ?1",
+                params![&id],
+            );
+            return id;
+        }
+
+        // Create new session
+        let id = format!("{}-{}", user_id, chrono::Utc::now().timestamp());
+        let _ = conn.execute(
+            "INSERT INTO sessions (id, user_id) VALUES (?1, ?2)",
+            params![&id, user_id as i64],
+        );
+        id
+    }
+
+    /// Load recent conversation history for a session (last N user+assistant message pairs).
+    pub fn load_history(&self, session_id: &str, max_pairs: usize) -> Vec<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let limit = (max_pairs * 2) as i64;
+        // Get last N messages ordered by id
+        let mut stmt = match conn.prepare(
+            "SELECT role, content FROM session_messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2"
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![session_id, limit], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map(|r| r.collect::<Result<Vec<_>, _>>().unwrap_or_default())
+            .unwrap_or_default();
+
+        // Reverse to chronological order
+        let mut result = rows;
+        result.reverse();
+        result
+    }
+
+    /// Append a message to the session history.
+    pub fn append_message(&self, session_id: &str, role: &str, content: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO session_messages (session_id, role, content) VALUES (?1, ?2, ?3)",
+            params![session_id, role, content],
+        );
+    }
+
     // --- Query logs ---
 
     pub fn log_query(

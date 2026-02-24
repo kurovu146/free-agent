@@ -142,17 +142,27 @@ pub async fn glob_search(pattern: &str, path: Option<&str>) -> String {
 
     let base_dir = path.unwrap_or(".");
 
-    // Extract filename part for -name matching
-    let name_part = Path::new(pattern)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| pattern.to_string());
-
-    let cmd = format!(
-        "find {} -name '{}' -type f 2>/dev/null | head -50 | sort",
-        shell_escape(base_dir),
-        shell_escape(&name_part)
-    );
+    // If pattern contains '/', use -path for directory-aware matching (e.g. src/**/*.rs)
+    // Otherwise use -name for simple filename matching (faster)
+    let cmd = if pattern.contains('/') {
+        // Convert glob ** to find-compatible * and prepend */ for relative matching
+        let find_pattern = format!("*/{}", pattern.replace("**", "*"));
+        format!(
+            "find {} -path '{}' -type f 2>/dev/null | head -50 | sort",
+            shell_escape(base_dir),
+            shell_escape(&find_pattern)
+        )
+    } else {
+        let name_part = Path::new(pattern)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| pattern.to_string());
+        format!(
+            "find {} -name '{}' -type f 2>/dev/null | head -50 | sort",
+            shell_escape(base_dir),
+            shell_escape(&name_part)
+        )
+    };
 
     let output = Command::new("bash")
         .arg("-c")

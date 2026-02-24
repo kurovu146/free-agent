@@ -28,7 +28,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        dotenvy::dotenv_override().ok();
+        dotenvy::from_path("/home/kuro/dev/free-agent/.env").ok();
 
         Self {
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")

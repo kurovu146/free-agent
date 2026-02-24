@@ -7,7 +7,7 @@ use tracing::{error, info};
 use crate::agent::{AgentLoop, AgentProgress};
 use crate::config::Config;
 use crate::db::Database;
-use crate::provider::ProviderPool;
+use crate::provider::{Message, MessageContent, ProviderPool, Role};
 use crate::skills;
 
 use super::formatter;
@@ -217,6 +217,24 @@ async fn handle_message(
         &memory_ctx,
     );
 
+    // Load conversation history
+    let session_id = state.db.get_or_create_session(user_id);
+    let raw_history = state.db.load_history(&session_id, 10);
+    let history: Vec<Message> = raw_history
+        .into_iter()
+        .filter_map(|(role, content)| {
+            let r = match role.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => return None,
+            };
+            Some(Message { role: r, content: MessageContent::Text(content) })
+        })
+        .collect();
+
+    // Save user message to history
+    state.db.append_message(&session_id, "user", &text);
+
     // Run agent loop
     let start = std::time::Instant::now();
     let result = AgentLoop::run(
@@ -230,6 +248,7 @@ async fn handle_message(
         &state.config.working_dir,
         state.config.bash_timeout,
         state.config.max_agent_turns,
+        history,
         on_progress,
     )
     .await;
@@ -242,6 +261,8 @@ async fn handle_message(
 
     match result {
         Ok(agent_result) => {
+            // Save assistant response to history
+            state.db.append_message(&session_id, "assistant", &agent_result.response);
             state.db.log_query(user_id, &agent_result.provider, &text, start.elapsed().as_millis() as u64, 0, 0);
 
             // Build final response with footer

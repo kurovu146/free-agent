@@ -37,6 +37,7 @@ impl AgentLoop {
         working_dir: &str,
         bash_timeout: u64,
         max_turns: usize,
+        history: Vec<Message>,
         on_progress: F,
     ) -> Result<AgentResult, String>
     where
@@ -46,16 +47,16 @@ impl AgentLoop {
         let mut tools_used: Vec<String> = Vec::new();
         let mut last_provider = String::new();
 
-        let mut messages = vec![
-            Message {
-                role: Role::System,
-                content: MessageContent::Text(system_prompt.to_string()),
-            },
-            Message {
-                role: Role::User,
-                content: MessageContent::Text(user_message.to_string()),
-            },
-        ];
+        // Build messages: system + history + current user message
+        let mut messages = vec![Message {
+            role: Role::System,
+            content: MessageContent::Text(system_prompt.to_string()),
+        }];
+        messages.extend(history);
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text(user_message.to_string()),
+        });
 
         for turn in 0..max_turns {
             debug!("Agent turn {}/{}", turn + 1, max_turns);
