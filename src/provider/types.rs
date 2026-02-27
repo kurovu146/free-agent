@@ -17,9 +17,19 @@ pub enum Role {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    pub media_type: String,
+    pub base64_data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
+    UserWithImage {
+        text: String,
+        images: Vec<ImageData>,
+    },
     ToolResult {
         tool_call_id: String,
         name: String,
@@ -35,6 +45,7 @@ impl MessageContent {
     pub fn as_text(&self) -> &str {
         match self {
             MessageContent::Text(s) => s,
+            MessageContent::UserWithImage { text, .. } => text,
             MessageContent::ToolResult { content, .. } => content,
             MessageContent::AssistantWithToolCalls { text, .. } => {
                 text.as_deref().unwrap_or("")

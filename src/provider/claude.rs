@@ -17,6 +17,7 @@ impl ClaudeProvider {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_model(model: &str) -> Self {
         Self {
             client: Client::new(),
@@ -96,6 +97,24 @@ fn build_claude_messages(messages: &[Message]) -> (String, Vec<serde_json::Value
                     "role": "user",
                     "content": text,
                 }));
+            }
+            // User messages with images → content blocks (vision)
+            (Role::User, MessageContent::UserWithImage { text, images }) => {
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                for img in images {
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": img.media_type,
+                            "data": img.base64_data,
+                        }
+                    }));
+                }
+                if !text.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": text }));
+                }
+                api_messages.push(json!({ "role": "user", "content": blocks }));
             }
             // Assistant text-only → simple text
             (Role::Assistant, MessageContent::Text(text)) => {

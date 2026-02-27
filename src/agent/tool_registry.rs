@@ -3,13 +3,14 @@ use serde_json::json;
 use crate::provider::{ToolDef, FunctionDef};
 use crate::tools;
 use crate::tools::gmail::GmailCreds;
+use crate::tools::claude_code::ClaudeCodeManager;
 
 /// Registry of all available tools with definitions and executor
 pub struct ToolRegistry;
 
 impl ToolRegistry {
     /// Get tool definitions to send to LLM
-    pub fn definitions(gmail_configured: bool, system_tools_enabled: bool) -> Vec<ToolDef> {
+    pub fn definitions(gmail_configured: bool, system_tools_enabled: bool, claude_code_enabled: bool) -> Vec<ToolDef> {
         let mut defs = vec![
             // --- Web ---
             tool_def("web_search",
@@ -336,6 +337,69 @@ impl ToolRegistry {
             ]);
         }
 
+        // Claude Code tools (tmux-based)
+        if claude_code_enabled {
+            defs.extend(vec![
+                tool_def("cc_start",
+                    "Start a new Claude Code session in a tmux window. Creates an interactive Claude Code CLI instance that persists across messages. Use this to delegate coding tasks.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Session name (alphanumeric, no spaces)" },
+                            "working_dir": { "type": "string", "description": "Absolute path to the working directory for this session" }
+                        },
+                        "required": ["name", "working_dir"]
+                    }),
+                ),
+                tool_def("cc_send",
+                    "Send a message/command to a running Claude Code session and wait for it to finish processing. Returns the Claude Code output.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Session name" },
+                            "message": { "type": "string", "description": "The message or instruction to send to Claude Code" },
+                            "timeout": { "type": "integer", "description": "Timeout in seconds (default: configured CC_TIMEOUT)" }
+                        },
+                        "required": ["name", "message"]
+                    }),
+                ),
+                tool_def("cc_read",
+                    "Read the current terminal output of a Claude Code session without sending any input.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Session name" }
+                        },
+                        "required": ["name"]
+                    }),
+                ),
+                tool_def("cc_list",
+                    "List all active Claude Code sessions with their status, working directory, and last activity time.",
+                    json!({ "type": "object", "properties": {} }),
+                ),
+                tool_def("cc_stop",
+                    "Stop and kill a Claude Code session. This terminates the tmux session.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Session name to stop" }
+                        },
+                        "required": ["name"]
+                    }),
+                ),
+                tool_def("cc_interrupt",
+                    "Send Ctrl+C to a Claude Code session to interrupt the current operation.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Session name to interrupt" }
+                        },
+                        "required": ["name"]
+                    }),
+                ),
+            ]);
+        }
+
         defs
     }
 
@@ -348,6 +412,7 @@ impl ToolRegistry {
         gmail_creds: &GmailCreds,
         working_dir: &str,
         bash_timeout: u64,
+        cc_manager: Option<&ClaudeCodeManager>,
     ) -> String {
         let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_default();
 
@@ -492,6 +557,61 @@ impl ToolRegistry {
                 let sid = args["spreadsheetId"].as_str().unwrap_or("");
                 let title = args["title"].as_str().unwrap_or("");
                 tools::sheets_create_tab(sid, title, gmail_creds).await
+            }
+            // --- Claude Code ---
+            "cc_start" => {
+                match cc_manager {
+                    Some(mgr) => {
+                        let name = args["name"].as_str().unwrap_or("");
+                        let dir = args["working_dir"].as_str().unwrap_or("");
+                        tools::cc_start(mgr, name, dir).await
+                    }
+                    None => "Claude Code is not enabled.".to_string(),
+                }
+            }
+            "cc_send" => {
+                match cc_manager {
+                    Some(mgr) => {
+                        let name = args["name"].as_str().unwrap_or("");
+                        let message = args["message"].as_str().unwrap_or("");
+                        let timeout = args["timeout"].as_u64();
+                        tools::cc_send(mgr, name, message, timeout).await
+                    }
+                    None => "Claude Code is not enabled.".to_string(),
+                }
+            }
+            "cc_read" => {
+                match cc_manager {
+                    Some(mgr) => {
+                        let name = args["name"].as_str().unwrap_or("");
+                        tools::cc_read(mgr, name).await
+                    }
+                    None => "Claude Code is not enabled.".to_string(),
+                }
+            }
+            "cc_list" => {
+                match cc_manager {
+                    Some(mgr) => tools::cc_list(mgr).await,
+                    None => "Claude Code is not enabled.".to_string(),
+                }
+            }
+            "cc_stop" => {
+                match cc_manager {
+                    Some(mgr) => {
+                        let name = args["name"].as_str().unwrap_or("");
+                        tools::cc_stop(mgr, name).await
+                    }
+                    None => "Claude Code is not enabled.".to_string(),
+                }
+            }
+            "cc_interrupt" => {
+                match cc_manager {
+                    Some(mgr) => {
+                        let name = args["name"].as_str().unwrap_or("");
+                        tools::cc_interrupt(mgr, name).await
+                    }
+                    None => "Claude Code is not enabled.".to_string(),
+                }
             }
             _ => format!("Unknown tool: {tool_name}"),
         }

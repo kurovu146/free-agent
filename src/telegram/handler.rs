@@ -1,14 +1,19 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
+use base64::Engine;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatAction, ParseMode};
-use tracing::{error, info};
+use teloxide::update_listeners::Polling;
+use tracing::{error, info, warn};
 
 use crate::agent::{AgentLoop, AgentProgress};
 use crate::config::Config;
 use crate::db::Database;
-use crate::provider::{Message, MessageContent, ProviderPool, Role};
+use crate::provider::{ImageData, Message, MessageContent, ProviderPool, Role};
 use crate::skills;
+use crate::tools::claude_code::ClaudeCodeManager;
 
 use super::formatter;
 
@@ -18,6 +23,7 @@ struct AppState {
     config: Config,
     skills_content: String,
     base_prompt: String,
+    cc_manager: Option<ClaudeCodeManager>,
 }
 
 pub async fn run_bot(config: Config) {
@@ -34,6 +40,14 @@ pub async fn run_bot(config: Config) {
     let db = Database::open("free-agent.db").expect("Failed to open database");
 
     let skills_content = skills::load_skills("skills");
+
+    // Create ClaudeCodeManager if enabled
+    let cc_ok = config.enable_claude_code;
+    let cc_manager = if cc_ok {
+        Some(ClaudeCodeManager::new(&config.claude_code_path, config.cc_timeout))
+    } else {
+        None
+    };
 
     // Build tool list dynamically based on config
     let gmail_ok = config.gmail_creds.is_configured();
@@ -53,6 +67,11 @@ pub async fn run_bot(config: Config) {
             "gmail_trash", "gmail_label", "gmail_list_labels",
             "sheets_read", "sheets_write", "sheets_append",
             "sheets_list", "sheets_create_tab",
+        ]);
+    }
+    if cc_ok {
+        tool_list.extend(&[
+            "cc_start", "cc_send", "cc_read", "cc_list", "cc_stop", "cc_interrupt",
         ]);
     }
 
@@ -121,14 +140,16 @@ pub async fn run_bot(config: Config) {
         config: config.clone(),
         skills_content,
         base_prompt,
+        cc_manager,
     });
 
     info!(
-        "Bot started. Providers: {:?}, Tools: {}, SystemTools: {}, Gmail: {}, Allowed users: {:?}",
+        "Bot started. Providers: {:?}, Tools: {}, SystemTools: {}, Gmail: {}, ClaudeCode: {}, Allowed users: {:?}",
         state.pool.available_providers(),
         tool_list.len(),
         if sys_ok { "enabled" } else { "disabled" },
         if gmail_ok { "enabled" } else { "disabled" },
+        if cc_ok { "enabled" } else { "disabled" },
         config.allowed_users
     );
 
@@ -149,11 +170,312 @@ pub async fn run_bot(config: Config) {
 
     let handler = Update::filter_message().endpoint(handle_message);
 
+    // Use custom polling listener: delete stale webhook + drop pending updates
+    // to prevent TerminatedByOtherGetUpdates on restart
+    let listener = Polling::builder(bot.clone())
+        .timeout(Duration::from_secs(10))
+        .drop_pending_updates()
+        .delete_webhook()
+        .await
+        .build();
+
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
         .build()
-        .dispatch()
+        .dispatch_with_listener(
+            listener,
+            LoggingErrorHandler::with_custom_text("Polling error"),
+        )
         .await;
+}
+
+// --- File upload helpers ---
+
+/// Download a file from Telegram by file_id.
+async fn download_telegram_file(bot: &Bot, file_id: &str, token: &str) -> Result<Vec<u8>, String> {
+    let file = bot
+        .get_file(file_id)
+        .await
+        .map_err(|e| format!("get_file failed: {e}"))?;
+
+    let file_path = file.path;
+    let url = format!("https://api.telegram.org/file/bot{token}/{file_path}");
+
+    let bytes = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("download failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("read bytes failed: {e}"))?;
+
+    Ok(bytes.to_vec())
+}
+
+/// Save bytes to {working_dir}/uploads/{filename}, returns full path.
+fn save_to_uploads(bytes: &[u8], filename: &str, working_dir: &str) -> Result<String, String> {
+    let uploads_dir = Path::new(working_dir).join("uploads");
+    std::fs::create_dir_all(&uploads_dir)
+        .map_err(|e| format!("create uploads dir: {e}"))?;
+
+    let dest = uploads_dir.join(filename);
+    std::fs::write(&dest, bytes)
+        .map_err(|e| format!("write file: {e}"))?;
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Check if a MIME type or file extension is text-based.
+fn is_text_mime(mime: &str) -> bool {
+    if mime.starts_with("text/") {
+        return true;
+    }
+    matches!(
+        mime,
+        "application/json"
+            | "application/xml"
+            | "application/toml"
+            | "application/x-yaml"
+            | "application/x-toml"
+            | "application/javascript"
+            | "application/typescript"
+            | "application/x-sh"
+            | "application/sql"
+            | "application/x-python"
+            | "application/x-ruby"
+    )
+}
+
+/// Check if a MIME type is an image.
+fn is_image_mime(mime: &str) -> bool {
+    mime.starts_with("image/")
+}
+
+/// Guess MIME type from file extension (fallback when Telegram doesn't provide it).
+fn mime_from_extension(filename: &str) -> &'static str {
+    match Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+        .as_str()
+    {
+        "txt" | "log" | "md" | "rst" => "text/plain",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "yaml" | "yml" => "application/x-yaml",
+        "toml" => "application/toml",
+        "js" | "mjs" => "application/javascript",
+        "ts" | "mts" => "application/typescript",
+        "sh" | "bash" | "zsh" => "application/x-sh",
+        "sql" => "application/sql",
+        "py" => "application/x-python",
+        "rb" => "application/x-ruby",
+        "rs" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "kt" | "swift"
+        | "cs" | "lua" | "r" | "pl" | "pm" | "php" | "css" | "scss"
+        | "html" | "htm" | "csv" | "tsv" | "ini" | "cfg" | "conf"
+        | "env" | "dockerfile" | "makefile" | "cmake" => "text/plain",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Process all attachments in a Telegram message.
+/// Returns (images for vision, extra text info about files).
+async fn process_attachments(
+    msg: &teloxide::types::Message,
+    bot: &Bot,
+    token: &str,
+    working_dir: &str,
+) -> (Vec<ImageData>, String) {
+    let mut images = Vec::new();
+    let mut file_text = String::new();
+
+    // Photos: always images for vision
+    if let Some(photos) = msg.photo() {
+        // Pick the largest photo (last in the array)
+        if let Some(largest) = photos.last() {
+            match download_telegram_file(bot, &largest.file.id, token).await {
+                Ok(bytes) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    images.push(ImageData {
+                        media_type: "image/jpeg".into(),
+                        base64_data: b64,
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to download photo: {e}");
+                    file_text.push_str(&format!("\n[Photo download failed: {e}]"));
+                }
+            }
+        }
+    }
+
+    // Documents
+    if let Some(doc) = msg.document() {
+        let file_name = doc
+            .file_name
+            .as_deref()
+            .unwrap_or("document");
+        let mime = doc
+            .mime_type
+            .as_ref()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| mime_from_extension(file_name).to_string());
+
+        match download_telegram_file(bot, &doc.file.id, token).await {
+            Ok(bytes) => {
+                if is_image_mime(&mime) {
+                    // Image document → vision
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    images.push(ImageData {
+                        media_type: mime,
+                        base64_data: b64,
+                    });
+                } else if is_text_mime(&mime) {
+                    // Text-based document → read content
+                    match String::from_utf8(bytes) {
+                        Ok(content) => {
+                            file_text.push_str(&format!(
+                                "\n\n--- File: {file_name} ---\n{content}\n--- End of file ---"
+                            ));
+                        }
+                        Err(utf8_err) => {
+                            // Not valid UTF-8, save as binary
+                            let raw = utf8_err.into_bytes();
+                            match save_to_uploads(
+                                &raw,
+                                file_name,
+                                working_dir,
+                            ) {
+                                Ok(path) => {
+                                    file_text.push_str(&format!(
+                                        "\n[File saved (not valid UTF-8): {path}]"
+                                    ));
+                                }
+                                Err(e) => {
+                                    file_text.push_str(&format!(
+                                        "\n[Failed to save file: {e}]"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Binary document → save to uploads
+                    match save_to_uploads(&bytes, file_name, working_dir) {
+                        Ok(path) => {
+                            file_text.push_str(&format!(
+                                "\n[File saved: {path} ({mime}, {} bytes)]",
+                                bytes.len()
+                            ));
+                        }
+                        Err(e) => {
+                            file_text.push_str(&format!("\n[Failed to save file: {e}]"));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to download document: {e}");
+                file_text.push_str(&format!("\n[Document download failed: {e}]"));
+            }
+        }
+    }
+
+    // Video
+    if let Some(video) = msg.video() {
+        let file_name = video
+            .file_name
+            .as_deref()
+            .unwrap_or("video.mp4");
+        match download_telegram_file(bot, &video.file.id, token).await {
+            Ok(bytes) => match save_to_uploads(&bytes, file_name, working_dir) {
+                Ok(path) => {
+                    file_text.push_str(&format!(
+                        "\n[Video saved: {path} ({} bytes)]",
+                        bytes.len()
+                    ));
+                }
+                Err(e) => file_text.push_str(&format!("\n[Failed to save video: {e}]")),
+            },
+            Err(e) => {
+                warn!("Failed to download video: {e}");
+                file_text.push_str(&format!("\n[Video download failed: {e}]"));
+            }
+        }
+    }
+
+    // Voice
+    if let Some(voice) = msg.voice() {
+        match download_telegram_file(bot, &voice.file.id, token).await {
+            Ok(bytes) => match save_to_uploads(&bytes, "voice.ogg", working_dir) {
+                Ok(path) => {
+                    file_text.push_str(&format!(
+                        "\n[Voice message saved: {path} ({} bytes, {}s)]",
+                        bytes.len(),
+                        voice.duration
+                    ));
+                }
+                Err(e) => file_text.push_str(&format!("\n[Failed to save voice: {e}]")),
+            },
+            Err(e) => {
+                warn!("Failed to download voice: {e}");
+                file_text.push_str(&format!("\n[Voice download failed: {e}]"));
+            }
+        }
+    }
+
+    // Audio
+    if let Some(audio) = msg.audio() {
+        let file_name = audio
+            .file_name
+            .as_deref()
+            .unwrap_or("audio.mp3");
+        match download_telegram_file(bot, &audio.file.id, token).await {
+            Ok(bytes) => match save_to_uploads(&bytes, file_name, working_dir) {
+                Ok(path) => {
+                    file_text.push_str(&format!(
+                        "\n[Audio saved: {path} ({} bytes)]",
+                        bytes.len()
+                    ));
+                }
+                Err(e) => file_text.push_str(&format!("\n[Failed to save audio: {e}]")),
+            },
+            Err(e) => {
+                warn!("Failed to download audio: {e}");
+                file_text.push_str(&format!("\n[Audio download failed: {e}]"));
+            }
+        }
+    }
+
+    // Animation (GIF)
+    if let Some(animation) = msg.animation() {
+        let file_name = animation
+            .file_name
+            .as_deref()
+            .unwrap_or("animation.mp4");
+        match download_telegram_file(bot, &animation.file.id, token).await {
+            Ok(bytes) => match save_to_uploads(&bytes, file_name, working_dir) {
+                Ok(path) => {
+                    file_text.push_str(&format!(
+                        "\n[Animation saved: {path} ({} bytes)]",
+                        bytes.len()
+                    ));
+                }
+                Err(e) => file_text.push_str(&format!("\n[Failed to save animation: {e}]")),
+            },
+            Err(e) => {
+                warn!("Failed to download animation: {e}");
+                file_text.push_str(&format!("\n[Animation download failed: {e}]"));
+            }
+        }
+    }
+
+    (images, file_text)
 }
 
 /// Edit a Telegram message, trying Markdown first then falling back to plain text.
@@ -186,19 +508,51 @@ async fn handle_message(
         return Ok(());
     }
 
-    // Get text content
-    let text = match msg.text() {
-        Some(t) if !t.is_empty() => t.to_string(),
-        _ => return Ok(()),
-    };
+    // Get text content (from text or caption)
+    let raw_text = msg
+        .text()
+        .or_else(|| msg.caption())
+        .unwrap_or("")
+        .to_string();
 
-    // Handle commands
-    if text.starts_with('/') {
-        return handle_command(&msg, &bot, &state, &text, user_id).await;
+    // Process file attachments
+    let (images, file_text) = process_attachments(
+        &msg,
+        &bot,
+        &state.config.telegram_bot_token,
+        &state.config.working_dir,
+    )
+    .await;
+
+    // Skip if no content at all
+    if raw_text.is_empty() && images.is_empty() && file_text.is_empty() {
+        return Ok(());
     }
 
-    // Parse inline provider override: "use claude ...", "dùng gemini ...", etc.
-    let (preferred_provider, user_text) = parse_provider_override(&text);
+    // Handle commands (only from pure text messages)
+    if raw_text.starts_with('/') && images.is_empty() && file_text.is_empty() {
+        return handle_command(&msg, &bot, &state, &raw_text, user_id).await;
+    }
+
+    // Parse inline provider override
+    let (preferred_provider, user_text_parsed) = parse_provider_override(&raw_text);
+
+    // Combine text content with file info
+    let combined_text = if file_text.is_empty() {
+        user_text_parsed.clone()
+    } else {
+        format!("{}{}", user_text_parsed, file_text)
+    };
+
+    // Build user content: with images or text-only
+    let user_content = if images.is_empty() {
+        MessageContent::Text(combined_text.clone())
+    } else {
+        MessageContent::UserWithImage {
+            text: combined_text.clone(),
+            images,
+        }
+    };
 
     // Send initial progress message
     let _ = bot.send_chat_action(msg.chat.id, ChatAction::Typing).await;
@@ -271,15 +625,15 @@ async fn handle_message(
         })
         .collect();
 
-    // Save user message to history
-    state.db.append_message(&session_id, "user", &user_text);
+    // Save user message to history (text-only for DB)
+    state.db.append_message(&session_id, "user", &combined_text);
 
     // Run agent loop
     let start = std::time::Instant::now();
     let result = AgentLoop::run(
         &state.pool,
         &system_prompt,
-        &user_text,
+        user_content,
         user_id,
         &state.db,
         &state.config.gmail_creds,
@@ -289,6 +643,7 @@ async fn handle_message(
         state.config.max_agent_turns,
         history,
         preferred_provider.as_deref(),
+        state.cc_manager.as_ref(),
         on_progress,
     )
     .await;
@@ -306,7 +661,7 @@ async fn handle_message(
 
             // Save assistant response to history
             state.db.append_message(&session_id, "assistant", &cleaned);
-            state.db.log_query(user_id, &agent_result.provider, &text, start.elapsed().as_millis() as u64, 0, 0);
+            state.db.log_query(user_id, &agent_result.provider, &raw_text, start.elapsed().as_millis() as u64, 0, 0);
 
             // Build final response with footer
             let footer = formatter::format_tools_footer(
@@ -388,13 +743,16 @@ async fn handle_command(
                 "enabled" } else { "disabled" };
             let sys_status = if state.config.enable_system_tools {
                 "enabled" } else { "disabled" };
+            let cc_status = if state.config.enable_claude_code {
+                "enabled" } else { "disabled" };
             bot.send_message(
                 msg.chat.id,
                 format!(
                     "KuroFree Bot\n\n\
                     Providers: {}\n\
                     Gmail/Sheets: {gmail_status}\n\
-                    System tools (bash/read/write): {sys_status}\n\n\
+                    System tools (bash/read/write): {sys_status}\n\
+                    Claude Code (tmux): {cc_status}\n\n\
                     /help for commands",
                     state.pool.available_providers().join(", ")
                 ),
@@ -483,6 +841,16 @@ async fn handle_command(
                     "sheets_append — Append rows",
                     "sheets_list — List sheet tabs",
                     "sheets_create_tab — Create new tab",
+                ]);
+            }
+            if state.config.enable_claude_code {
+                tools.extend(&[
+                    "cc_start — Start Claude Code session",
+                    "cc_send — Send message to Claude Code",
+                    "cc_read — Read session output",
+                    "cc_list — List active sessions",
+                    "cc_stop — Stop a session",
+                    "cc_interrupt — Send Ctrl+C to session",
                 ]);
             }
             bot.send_message(msg.chat.id, tools.join("\n")).await?;

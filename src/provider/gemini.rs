@@ -84,6 +84,21 @@ pub fn build_oai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         "content": text,
                     })
                 }
+                MessageContent::UserWithImage { text, images } => {
+                    let mut parts: Vec<serde_json::Value> = Vec::new();
+                    for img in images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", img.media_type, img.base64_data)
+                            }
+                        }));
+                    }
+                    if !text.is_empty() {
+                        parts.push(json!({ "type": "text", "text": text }));
+                    }
+                    json!({ "role": "user", "content": parts })
+                }
                 MessageContent::ToolResult { tool_call_id, name, content } => json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,

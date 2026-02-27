@@ -237,6 +237,8 @@ pub fn tool_icon(name: &str) -> &str {
         "get_datetime" => "🕐",
         _ if name.starts_with("gmail_") => "📧",
         _ if name.starts_with("sheets_") => "📊",
+        _ if name.starts_with("cc_") => "🤖",
+        "file_upload" => "📎",
         _ => "🔧",
     }
 }

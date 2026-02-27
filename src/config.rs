@@ -16,6 +16,7 @@ pub struct Config {
     // Defaults
     pub default_provider: String,
     pub max_agent_turns: usize,
+    #[allow(dead_code)]
     pub max_queue_depth: usize,
 
     // Google OAuth (Gmail + Sheets)
@@ -25,11 +26,16 @@ pub struct Config {
     pub enable_system_tools: bool,
     pub working_dir: String,
     pub bash_timeout: u64,
+
+    // Claude Code (tmux-based control)
+    pub enable_claude_code: bool,
+    pub claude_code_path: String,
+    pub cc_timeout: u64,
 }
 
 impl Config {
     pub fn from_env() -> Self {
-        dotenvy::from_path_override("/home/kuro/dev/free-agent/.env").ok();
+        dotenvy::dotenv_override().ok();
 
         Self {
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
@@ -66,6 +72,15 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
+            enable_claude_code: env::var("ENABLE_CLAUDE_CODE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            claude_code_path: env::var("CLAUDE_CODE_PATH")
+                .unwrap_or_else(|_| "claude".into()),
+            cc_timeout: env::var("CC_TIMEOUT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
         }
     }
 }

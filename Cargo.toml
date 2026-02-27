@@ -44,6 +44,9 @@ thiserror = "2"
 # URL encoding
 urlencoding = "2"
 
+# Base64 encoding (for image uploads)
+base64 = "0.22"
+
 [profile.release]
 opt-level = "z"
 lto = true

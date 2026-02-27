@@ -3,6 +3,7 @@ use tracing::{debug, info, warn};
 use crate::db::Database;
 use crate::provider::{Message, MessageContent, ProviderPool, Role};
 use crate::tools::gmail::GmailCreds;
+use crate::tools::claude_code::ClaudeCodeManager;
 
 use super::tool_registry::ToolRegistry;
 
@@ -33,7 +34,7 @@ impl AgentLoop {
     pub async fn run<F>(
         pool: &ProviderPool,
         system_prompt: &str,
-        user_message: &str,
+        user_content: MessageContent,
         user_id: u64,
         db: &Database,
         gmail_creds: &GmailCreds,
@@ -43,12 +44,13 @@ impl AgentLoop {
         max_turns: usize,
         history: Vec<Message>,
         preferred_provider: Option<&str>,
+        cc_manager: Option<&ClaudeCodeManager>,
         on_progress: F,
     ) -> Result<AgentResult, String>
     where
         F: Fn(AgentProgress),
     {
-        let tools = ToolRegistry::definitions(gmail_creds.is_configured(), system_tools_enabled);
+        let tools = ToolRegistry::definitions(gmail_creds.is_configured(), system_tools_enabled, cc_manager.is_some());
         let mut tools_used: Vec<String> = Vec::new();
         let mut last_provider = String::new();
 
@@ -60,7 +62,7 @@ impl AgentLoop {
         messages.extend(history);
         messages.push(Message {
             role: Role::User,
-            content: MessageContent::Text(user_message.to_string()),
+            content: user_content,
         });
 
         for turn in 0..max_turns {
@@ -121,6 +123,7 @@ impl AgentLoop {
                     gmail_creds,
                     working_dir,
                     bash_timeout,
+                    cc_manager,
                 )
                 .await;
 
