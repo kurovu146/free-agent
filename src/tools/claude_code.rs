@@ -1,20 +1,23 @@
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use chrono::Utc;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-/// Info about a running Claude Code tmux session.
+/// Info about a Claude Code session (conversation continuity via --resume).
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
+    pub session_id: Option<String>,
     pub working_dir: String,
     pub created_at: String,
     pub last_activity: String,
 }
 
-/// Manages Claude Code tmux sessions.
+/// Manages Claude Code sessions using `--print` (non-interactive) mode.
 #[derive(Clone)]
 pub struct ClaudeCodeManager {
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
@@ -36,11 +39,8 @@ impl ClaudeCodeManager {
 // Public tool functions
 // ---------------------------------------------------------------------------
 
-/// Start a new Claude Code session in a tmux window.
+/// Start a new Claude Code session (register name + working dir).
 pub async fn cc_start(mgr: &ClaudeCodeManager, name: &str, working_dir: &str) -> String {
-    let session_name = format!("cc-{name}");
-
-    // Check if session already exists
     {
         let sessions = mgr.sessions.read().await;
         if sessions.contains_key(name) {
@@ -48,28 +48,13 @@ pub async fn cc_start(mgr: &ClaudeCodeManager, name: &str, working_dir: &str) ->
         }
     }
 
-    // Verify working_dir exists
     if !std::path::Path::new(working_dir).is_dir() {
         return format!("Directory does not exist: {working_dir}");
     }
 
-    // Create tmux session running Claude Code CLI
-    let create_result = tmux_cmd(&[
-        "new-session", "-d",
-        "-s", &session_name,
-        "-c", working_dir,
-        &mgr.claude_path,
-    ]).await;
-
-    if let Err(e) = create_result {
-        return format!("Failed to create tmux session: {e}");
-    }
-
-    // Wait for Claude Code to initialize
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
     let now = Utc::now().to_rfc3339();
     let info = SessionInfo {
+        session_id: None,
         working_dir: working_dir.to_string(),
         created_at: now.clone(),
         last_activity: now,
@@ -77,73 +62,125 @@ pub async fn cc_start(mgr: &ClaudeCodeManager, name: &str, working_dir: &str) ->
 
     mgr.sessions.write().await.insert(name.to_string(), info);
 
-    // Read initial output
-    let output = capture_pane(&session_name).await.unwrap_or_default();
-    let clean = strip_ansi(&output);
-
-    format!("Session '{name}' started in {working_dir}\n\nInitial output:\n{clean}")
+    format!("Session '{name}' created for {working_dir}. Use cc_send to send messages.")
 }
 
-/// Send a message to a Claude Code session and wait for completion.
+/// Send a message to Claude Code using --print mode.
+/// If the session has a previous session_id, uses --resume for continuity.
 pub async fn cc_send(mgr: &ClaudeCodeManager, name: &str, message: &str, timeout: Option<u64>) -> String {
-    let session_name = format!("cc-{name}");
     let timeout_secs = timeout.unwrap_or(mgr.default_timeout);
 
-    // Verify session exists
-    {
+    let (working_dir, session_id) = {
         let sessions = mgr.sessions.read().await;
-        if !sessions.contains_key(name) {
-            return format!("Session '{name}' not found. Use cc_start first.");
+        match sessions.get(name) {
+            Some(info) => (info.working_dir.clone(), info.session_id.clone()),
+            None => return format!("Session '{name}' not found. Use cc_start first."),
         }
+    };
+
+    let mut args = vec![
+        "--print".to_string(),
+        "--output-format".to_string(), "json".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+    ];
+
+    // Resume previous conversation if we have a session_id
+    if let Some(ref sid) = session_id {
+        args.push("--resume".to_string());
+        args.push(sid.clone());
     }
 
-    // Capture baseline before sending
-    let baseline = capture_pane(&session_name).await.unwrap_or_default();
+    args.push(message.to_string());
 
-    // Send message via tmux send-keys (literal mode to avoid key interpretation)
-    if let Err(e) = tmux_cmd(&["send-keys", "-t", &session_name, "-l", message]).await {
-        return format!("Failed to send message: {e}");
-    }
-    // Press Enter
-    if let Err(e) = tmux_cmd(&["send-keys", "-t", &session_name, "Enter"]).await {
-        return format!("Failed to send Enter: {e}");
-    }
+    debug!("cc_send: {} {:?} in {}", mgr.claude_path, args, working_dir);
 
-    // Wait for completion
-    let result = wait_for_completion(&session_name, &baseline, timeout_secs).await;
+    let child = Command::new(&mgr.claude_path)
+        .args(&args)
+        .current_dir(&working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
 
-    // Update last_activity
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return format!("Failed to start claude: {e}"),
+    };
+
+    // Wait with timeout
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        async {
+            let mut stdout_buf = Vec::new();
+            let mut stderr_buf = Vec::new();
+
+            if let Some(ref mut stdout) = child.stdout {
+                let _ = stdout.read_to_end(&mut stdout_buf).await;
+            }
+            if let Some(ref mut stderr) = child.stderr {
+                let _ = stderr.read_to_end(&mut stderr_buf).await;
+            }
+
+            let status = child.wait().await;
+            (stdout_buf, stderr_buf, status)
+        }
+    ).await;
+
+    let (stdout_bytes, stderr_bytes) = match result {
+        Ok((stdout, stderr, status)) => {
+            if let Ok(s) = &status {
+                if !s.success() {
+                    let stderr_str = String::from_utf8_lossy(&stderr);
+                    warn!("claude exited with {s}: {stderr_str}");
+                }
+            }
+            (stdout, stderr)
+        }
+        Err(_) => {
+            // Timeout — kill the process
+            let _ = child.kill().await;
+            warn!("cc_send timed out after {timeout_secs}s for session '{name}'");
+            return format!("[TIMEOUT after {timeout_secs}s — Claude Code did not respond in time]");
+        }
+    };
+
+    let stdout_str = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes).to_string();
+
+    // Parse JSON output to extract result and session_id
+    let (response_text, new_session_id) = parse_cc_json_output(&stdout_str);
+
+    // Update session info
     {
         let mut sessions = mgr.sessions.write().await;
         if let Some(info) = sessions.get_mut(name) {
             info.last_activity = Utc::now().to_rfc3339();
-        }
-    }
-
-    result
-}
-
-/// Read current pane content of a session.
-pub async fn cc_read(mgr: &ClaudeCodeManager, name: &str) -> String {
-    let session_name = format!("cc-{name}");
-
-    {
-        let sessions = mgr.sessions.read().await;
-        if !sessions.contains_key(name) {
-            return format!("Session '{name}' not found.");
-        }
-    }
-
-    match capture_pane(&session_name).await {
-        Ok(output) => {
-            let clean = strip_ansi(&output);
-            if clean.trim().is_empty() {
-                "(pane is empty)".to_string()
-            } else {
-                clean
+            if let Some(sid) = new_session_id {
+                info.session_id = Some(sid);
             }
         }
-        Err(e) => format!("Failed to read session: {e}"),
+    }
+
+    if response_text.is_empty() && !stderr_str.is_empty() {
+        format!("[Claude Code error]\n{stderr_str}")
+    } else if response_text.is_empty() {
+        format!("[No output from Claude Code]\nstdout: {stdout_str}\nstderr: {stderr_str}")
+    } else {
+        response_text
+    }
+}
+
+/// Read session info (no pane to read in --print mode, show metadata).
+pub async fn cc_read(mgr: &ClaudeCodeManager, name: &str) -> String {
+    let sessions = mgr.sessions.read().await;
+    match sessions.get(name) {
+        Some(info) => {
+            let sid = info.session_id.as_deref().unwrap_or("(none yet)");
+            format!(
+                "Session '{name}':\n  dir: {}\n  session_id: {sid}\n  created: {}\n  last_activity: {}",
+                info.working_dir, info.created_at, info.last_activity
+            )
+        }
+        None => format!("Session '{name}' not found."),
     }
 }
 
@@ -157,231 +194,60 @@ pub async fn cc_list(mgr: &ClaudeCodeManager) -> String {
 
     let mut lines = Vec::new();
     for (name, info) in sessions.iter() {
-        let session_name = format!("cc-{name}");
-        let alive = check_session_alive(&session_name).await;
-        let status = if alive { "running" } else { "dead" };
+        let sid = info.session_id.as_deref().unwrap_or("new");
         lines.push(format!(
-            "- {name} [{status}] dir={} created={} last_activity={}",
-            info.working_dir, info.created_at, info.last_activity
+            "- {name} dir={} session={sid} last_activity={}",
+            info.working_dir, info.last_activity
         ));
     }
 
     lines.join("\n")
 }
 
-/// Stop and kill a session.
+/// Remove a session from tracking.
 pub async fn cc_stop(mgr: &ClaudeCodeManager, name: &str) -> String {
-    let session_name = format!("cc-{name}");
-
-    {
-        let sessions = mgr.sessions.read().await;
-        if !sessions.contains_key(name) {
-            return format!("Session '{name}' not found.");
-        }
+    let mut sessions = mgr.sessions.write().await;
+    if sessions.remove(name).is_some() {
+        format!("Session '{name}' removed.")
+    } else {
+        format!("Session '{name}' not found.")
     }
-
-    let _ = tmux_cmd(&["kill-session", "-t", &session_name]).await;
-    mgr.sessions.write().await.remove(name);
-
-    format!("Session '{name}' stopped.")
 }
 
-/// Send Ctrl+C interrupt to a session.
-pub async fn cc_interrupt(mgr: &ClaudeCodeManager, name: &str) -> String {
-    let session_name = format!("cc-{name}");
-
-    {
-        let sessions = mgr.sessions.read().await;
-        if !sessions.contains_key(name) {
-            return format!("Session '{name}' not found.");
-        }
-    }
-
-    match tmux_cmd(&["send-keys", "-t", &session_name, "C-c"]).await {
-        Ok(_) => format!("Sent Ctrl+C to session '{name}'."),
-        Err(e) => format!("Failed to interrupt: {e}"),
-    }
+/// Interrupt is not applicable in --print mode (process runs to completion).
+/// This is kept for API compatibility — it returns a helpful message.
+pub async fn cc_interrupt(_mgr: &ClaudeCodeManager, _name: &str) -> String {
+    "cc_interrupt is not needed in --print mode. Each cc_send runs to completion or times out.".to_string()
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Run a tmux command and return stdout.
-async fn tmux_cmd(args: &[&str]) -> Result<String, String> {
-    debug!("tmux {}", args.join(" "));
-    let output = Command::new("tmux")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("tmux exec error: {e}"))?;
+/// Parse Claude Code --output-format json response.
+/// Returns (response_text, Option<session_id>).
+fn parse_cc_json_output(output: &str) -> (String, Option<String>) {
+    // The JSON output format returns a single JSON object with result and session_id
+    let trimmed = output.trim();
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("tmux error: {stderr}"))
-    }
-}
+    // Try parsing as a single JSON object
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let session_id = val["session_id"].as_str().map(|s| s.to_string());
+        let result = val["result"].as_str().unwrap_or("").to_string();
 
-/// Capture the full pane content of a tmux session.
-async fn capture_pane(session_name: &str) -> Result<String, String> {
-    tmux_cmd(&["capture-pane", "-t", session_name, "-p", "-S", "-", "-E", "-"])
-        .await
-}
-
-/// Check if a tmux session is alive.
-async fn check_session_alive(session_name: &str) -> bool {
-    tmux_cmd(&["has-session", "-t", session_name]).await.is_ok()
-}
-
-/// Strip ANSI escape codes (CSI sequences, OSC, carriage returns).
-fn strip_ansi(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => {
-                // ESC sequence
-                match chars.peek() {
-                    Some('[') => {
-                        // CSI sequence: ESC [ ... final_byte
-                        chars.next();
-                        while let Some(&ch) = chars.peek() {
-                            if ch.is_ascii_alphabetic() || ch == '@' || ch == '~' {
-                                chars.next();
-                                break;
-                            }
-                            chars.next();
-                        }
-                    }
-                    Some(']') => {
-                        // OSC sequence: ESC ] ... ST (BEL or ESC \)
-                        chars.next();
-                        while let Some(&ch) = chars.peek() {
-                            if ch == '\x07' {
-                                chars.next();
-                                break;
-                            }
-                            if ch == '\x1b' {
-                                chars.next();
-                                if chars.peek() == Some(&'\\') {
-                                    chars.next();
-                                }
-                                break;
-                            }
-                            chars.next();
-                        }
-                    }
-                    Some('(') | Some(')') => {
-                        // Character set designation — skip 2 chars
-                        chars.next();
-                        chars.next();
-                    }
-                    _ => {
-                        // Unknown ESC — skip one char
-                        chars.next();
-                    }
-                }
-            }
-            '\r' => {
-                // Skip carriage return
-            }
-            _ => {
-                result.push(c);
-            }
+        if !result.is_empty() {
+            return (result, session_id);
         }
+
+        // Sometimes the response is in "content" or nested differently
+        if let Some(content) = val["content"].as_str() {
+            return (content.to_string(), session_id);
+        }
+
+        // Fall through to return the whole JSON as text
+        return (trimmed.to_string(), session_id);
     }
 
-    result
-}
-
-/// Check if the last non-empty line looks like an interactive prompt.
-fn looks_like_prompt(content: &str) -> bool {
-    let last_line = content
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty());
-
-    match last_line {
-        Some(line) => {
-            let trimmed = line.trim();
-            // Must be short (prompt lines are typically < 200 chars)
-            if trimmed.len() > 200 {
-                return false;
-            }
-            // Common prompt indicators
-            trimmed.ends_with('>')
-                || trimmed.ends_with('❯')
-                || trimmed.ends_with("$ ")
-                || trimmed == "$"
-                || trimmed == ">"
-                || trimmed == "❯"
-        }
-        None => false,
-    }
-}
-
-/// Extract the new content that appeared after the baseline.
-fn extract_response(baseline: &str, current: &str) -> String {
-    let baseline_clean = strip_ansi(baseline);
-    let current_clean = strip_ansi(current);
-
-    let baseline_lines: Vec<&str> = baseline_clean.lines().collect();
-    let current_lines: Vec<&str> = current_clean.lines().collect();
-
-    // Find where the new content starts by looking for the divergence point
-    let common = baseline_lines
-        .iter()
-        .zip(current_lines.iter())
-        .take_while(|(a, b)| a == b)
-        .count();
-
-    let new_lines: Vec<&str> = current_lines[common..].to_vec();
-    new_lines.join("\n")
-}
-
-/// Poll until Claude Code output stabilizes and a prompt appears.
-async fn wait_for_completion(session_name: &str, baseline: &str, timeout_secs: u64) -> String {
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-
-    // Initial wait for Claude Code to start processing
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    let mut prev_content = String::new();
-    let mut stable_count = 0u32;
-
-    loop {
-        if start.elapsed() > timeout {
-            let current = capture_pane(session_name).await.unwrap_or_default();
-            let response = extract_response(baseline, &current);
-            let clean = strip_ansi(&response);
-            warn!("cc_send timed out after {timeout_secs}s for {session_name}");
-            return format!("{clean}\n\n[TIMEOUT after {timeout_secs}s — output may be incomplete]");
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-        let current = match capture_pane(session_name).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let clean = strip_ansi(&current);
-
-        if clean == prev_content {
-            stable_count += 1;
-        } else {
-            stable_count = 0;
-            prev_content = clean.clone();
-        }
-
-        // Output hasn't changed for 2 consecutive polls AND last line is a prompt
-        if stable_count >= 2 && looks_like_prompt(&clean) {
-            let response = extract_response(baseline, &current);
-            return strip_ansi(&response);
-        }
-    }
+    // If not valid JSON, return raw output (--print text mode fallback)
+    (trimmed.to_string(), None)
 }
