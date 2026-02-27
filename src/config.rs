@@ -67,7 +67,7 @@ impl Config {
             enable_system_tools: env::var("ENABLE_SYSTEM_TOOLS")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
-            working_dir: env::var("WORKING_DIR").unwrap_or_else(|_| ".".into()),
+            working_dir: expand_tilde(&env::var("WORKING_DIR").unwrap_or_else(|_| ".".into())),
             bash_timeout: env::var("BASH_TIMEOUT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -83,6 +83,16 @@ impl Config {
                 .unwrap_or(300),
         }
     }
+}
+
+/// Expand `~` to home directory. Works on both macOS and Linux.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = env::var("HOME").ok() {
+            return path.replacen('~', &home, 1);
+        }
+    }
+    path.to_string()
 }
 
 fn parse_keys(env_var: &str) -> Vec<String> {

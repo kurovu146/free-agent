@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::db::Database;
@@ -45,6 +47,7 @@ impl AgentLoop {
         history: Vec<Message>,
         preferred_provider: Option<&str>,
         cc_manager: Option<&ClaudeCodeManager>,
+        cancel_flag: &Arc<AtomicBool>,
         on_progress: F,
     ) -> Result<AgentResult, String>
     where
@@ -66,6 +69,29 @@ impl AgentLoop {
         });
 
         for turn in 0..max_turns {
+            // Check cancel flag before each turn
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Agent cancelled by user at turn {}", turn + 1);
+                let last_text = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant)
+                    .map(|m| m.content.as_text().to_string())
+                    .unwrap_or_default();
+                let (deduped, counts) = dedup_with_counts(&tools_used);
+                return Ok(AgentResult {
+                    response: if last_text.is_empty() {
+                        "Query đã bị dừng.".into()
+                    } else {
+                        format!("{last_text}\n\n_— Query đã bị dừng._")
+                    },
+                    tools_used: deduped,
+                    tools_count: counts,
+                    provider: last_provider.clone(),
+                    turns: turn,
+                });
+            }
+
             debug!("Agent turn {}/{}", turn + 1, max_turns);
             on_progress(AgentProgress::Thinking);
 

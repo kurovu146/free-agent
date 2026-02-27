@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use base64::Engine;
 use teloxide::prelude::*;
@@ -24,6 +25,8 @@ struct AppState {
     skills_content: String,
     base_prompt: String,
     cc_manager: Option<ClaudeCodeManager>,
+    /// Cancel flags per chat_id: set to true to abort running agent loop.
+    cancel_flags: std::sync::Mutex<HashMap<i64, Arc<AtomicBool>>>,
 }
 
 pub async fn run_bot(config: Config) {
@@ -141,6 +144,7 @@ pub async fn run_bot(config: Config) {
         skills_content,
         base_prompt,
         cc_manager,
+        cancel_flags: std::sync::Mutex::new(HashMap::new()),
     });
 
     info!(
@@ -158,6 +162,7 @@ pub async fn run_bot(config: Config) {
         BotCommand::new("start", "Bot info & status"),
         BotCommand::new("help", "Show available commands"),
         BotCommand::new("new", "Start new conversation"),
+        BotCommand::new("stop", "Stop current query"),
         BotCommand::new("tools", "List available tools"),
         BotCommand::new("memory", "View saved memories"),
         BotCommand::new("providers", "Show LLM providers"),
@@ -628,6 +633,13 @@ async fn handle_message(
     // Save user message to history (text-only for DB)
     state.db.append_message(&session_id, "user", &combined_text);
 
+    // Set up cancel flag for this chat
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut flags = state.cancel_flags.lock().unwrap();
+        flags.insert(msg.chat.id.0, cancel_flag.clone());
+    }
+
     // Run agent loop
     let start = std::time::Instant::now();
     let result = AgentLoop::run(
@@ -644,11 +656,18 @@ async fn handle_message(
         history,
         preferred_provider.as_deref(),
         state.cc_manager.as_ref(),
+        &cancel_flag,
         on_progress,
     )
     .await;
 
     let elapsed_secs = start.elapsed().as_secs_f64();
+
+    // Clean up cancel flag
+    {
+        let mut flags = state.cancel_flags.lock().unwrap();
+        flags.remove(&msg.chat.id.0);
+    }
 
     // Stop typing indicator
     typing_active.store(false, Ordering::Relaxed);
@@ -765,12 +784,32 @@ async fn handle_command(
                 "/start — Bot info\n\
                  /help — Show commands\n\
                  /new — Start new conversation\n\
+                 /stop — Stop current query\n\
                  /memory — List saved facts\n\
                  /providers — Show available providers\n\
                  /tools — List available tools\n\n\
                  Tip: Prefix \"use claude\"/\"dùng gemini\" to pick a provider for one message.",
             )
             .await?;
+        }
+        "/stop" => {
+            let chat_id = msg.chat.id.0;
+            let cancelled = {
+                let flags = state.cancel_flags.lock().unwrap();
+                if let Some(flag) = flags.get(&chat_id) {
+                    flag.store(true, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            };
+            if cancelled {
+                bot.send_message(msg.chat.id, "Đã dừng query hiện tại.")
+                    .await?;
+            } else {
+                bot.send_message(msg.chat.id, "Không có query nào đang chạy.")
+                    .await?;
+            }
         }
         "/new" => {
             state.db.clear_session(user_id);
