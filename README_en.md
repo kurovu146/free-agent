@@ -6,7 +6,7 @@ Built in Rust for minimal resource usage (~5-15MB RAM, ~7MB binary).
 
 ## Features
 
-- **Multi-provider**: Gemini 2.5 Flash, Groq Llama 3.3 70B, Mistral Small, Claude (optional)
+- **Multi-provider**: Gemini 3.1 Flash Lite, Groq Llama 3.3 70B, Mistral Small, Claude (optional)
 - **Smart key rotation**: Multiple API keys per provider with round-robin; retries all keys before falling back
 - **Auto-fallback**: If one provider hits rate limit or errors, seamlessly tries the next
 - **Agent loop**: LLM calls tools, gets results, calls again — up to N turns per message
@@ -138,7 +138,7 @@ Telegram Handler
   ▼
 Agent Loop (max N turns)
   ├── Call LLM ──► Provider Pool (round-robin + fallback)
-  │                  ├── Gemini 2.5 Flash (keys: k1, k2, k3, k4...)
+  │                  ├── Gemini 3.1 Flash Lite (keys: k1, k2, k3, k4...)
   │                  ├── Groq Llama 3.3 70B (keys: k1, k2...)
   │                  ├── Mistral Small (keys: k1...)
   │                  └── Claude Sonnet (optional, keys: k1...)
@@ -163,7 +163,7 @@ src/
 │   └── tool_registry.rs # Tool definitions + dispatch
 ├── provider/
 │   ├── pool.rs          # Round-robin pool with per-key retry + fallback
-│   ├── gemini.rs        # Gemini 2.5 Flash (OpenAI-compatible)
+│   ├── gemini.rs        # Gemini 3.1 Flash Lite (OpenAI-compatible)
 │   ├── groq.rs          # Groq Llama 3.3 70B (OpenAI-compatible)
 │   ├── mistral.rs       # Mistral Small (OpenAI-compatible)
 │   ├── claude.rs        # Claude Sonnet (Anthropic API)

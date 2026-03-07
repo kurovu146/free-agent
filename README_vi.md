@@ -6,7 +6,7 @@ Viết bằng Rust, tối ưu tài nguyên (~5-15MB RAM, binary ~7MB).
 
 ## Tính năng
 
-- **Đa provider**: Gemini 2.5 Flash, Groq Llama 3.3 70B, Mistral Small, Claude (tùy chọn)
+- **Đa provider**: Gemini 3.1 Flash Lite, Groq Llama 3.3 70B, Mistral Small, Claude (tùy chọn)
 - **Xoay vòng key thông minh**: Nhiều API key mỗi provider, luân phiên tự động; thử tất cả key trước khi chuyển provider
 - **Tự động fallback**: Nếu một provider lỗi hoặc rate limit, chuyển sang provider tiếp theo
 - **Agent loop**: LLM gọi tool, nhận kết quả, gọi tiếp — tối đa N lượt mỗi tin nhắn
@@ -138,7 +138,7 @@ Telegram Handler
   ▼
 Agent Loop (tối đa N lượt)
   ├── Gọi LLM ──► Provider Pool (xoay vòng + fallback)
-  │                  ├── Gemini 2.5 Flash (keys: k1, k2, k3, k4...)
+  │                  ├── Gemini 3.1 Flash Lite (keys: k1, k2, k3, k4...)
   │                  ├── Groq Llama 3.3 70B (keys: k1, k2...)
   │                  ├── Mistral Small (keys: k1...)
   │                  └── Claude Sonnet (tùy chọn, keys: k1...)
@@ -163,7 +163,7 @@ src/
 │   └── tool_registry.rs # Định nghĩa tool + dispatch
 ├── provider/
 │   ├── pool.rs          # Round-robin pool với retry từng key + fallback
-│   ├── gemini.rs        # Gemini 2.5 Flash (OpenAI-compatible)
+│   ├── gemini.rs        # Gemini 3.1 Flash Lite (OpenAI-compatible)
 │   ├── groq.rs          # Groq Llama 3.3 70B (OpenAI-compatible)
 │   ├── mistral.rs       # Mistral Small (OpenAI-compatible)
 │   ├── claude.rs        # Claude Sonnet (Anthropic API)
