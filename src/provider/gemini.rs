@@ -60,6 +60,16 @@ impl GeminiProvider {
             body["toolConfig"] = json!({ "functionCallingConfig": { "mode": "AUTO" } });
         }
 
+        // Disable thinking for Gemini 2.5+ models — we only want the final answer.
+        if !is_gemma {
+            body["generationConfig"] = json!({
+                "thinkingConfig": {
+                    "thinkingBudget": 0,
+                    "includeThoughts": false,
+                }
+            });
+        }
+
         let resp = self
             .client
             .post(&url)
@@ -215,6 +225,10 @@ async fn parse_google_response(resp: reqwest::Response) -> Result<LlmResponse, P
     let mut tool_calls: Vec<ToolCall> = Vec::new();
 
     for (idx, part) in parts.iter().enumerate() {
+        // Skip thinking parts — Gemini 2.5+ may return reasoning with `thought: true`.
+        if part["thought"].as_bool().unwrap_or(false) {
+            continue;
+        }
         if let Some(text) = part["text"].as_str() {
             if !text.is_empty() {
                 text_parts.push(text.to_string());
