@@ -12,7 +12,7 @@ impl GeminiProvider {
     pub fn new() -> Self {
         Self {
             client: Client::new(),
-            model: "gemini-3.1-flash-lite-preview".into(),
+            model: "gemma-4-31b-it".into(),
         }
     }
 }

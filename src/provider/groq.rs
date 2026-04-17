@@ -13,7 +13,7 @@ impl GroqProvider {
     pub fn new() -> Self {
         Self {
             client: Client::new(),
-            model: "llama-3.3-70b-versatile".into(),
+            model: "openai/gpt-oss-120b".into(),
         }
     }
 }
