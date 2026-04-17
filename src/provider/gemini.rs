@@ -15,6 +15,10 @@ impl GeminiProvider {
             model: "gemma-4-31b-it".into(),
         }
     }
+
+    fn is_gemma(&self) -> bool {
+        self.model.starts_with("gemma")
+    }
 }
 
 impl GeminiProvider {
@@ -24,26 +28,42 @@ impl GeminiProvider {
         tools: &[ToolDef],
         api_key: &str,
     ) -> Result<LlmResponse, ProviderError> {
-        // Gemini OpenAI-compatible endpoint
         let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            self.model
         );
 
-        let mut body = json!({
-            "model": self.model,
-            "messages": build_oai_messages(messages),
-        });
+        let is_gemma = self.is_gemma();
+        let (contents, system_instruction) = build_google_contents(messages, is_gemma);
 
-        if !tools.is_empty() {
-            body["tools"] = serde_json::to_value(tools)
-                .map_err(|e| ProviderError::ParseError(e.to_string()))?;
-            body["tool_choice"] = json!("auto");
+        let mut body = json!({ "contents": contents });
+
+        if !is_gemma {
+            if let Some(sys) = system_instruction {
+                body["systemInstruction"] = sys;
+            }
+        }
+
+        // Gemma models don't support function calling; skip tools for them.
+        if !tools.is_empty() && !is_gemma {
+            let decls: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "parameters": t.function.parameters,
+                    })
+                })
+                .collect();
+            body["tools"] = json!([{ "functionDeclarations": decls }]);
+            body["toolConfig"] = json!({ "functionCallingConfig": { "mode": "AUTO" } });
         }
 
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(api_key)
+            .header("x-goog-api-key", api_key)
             .json(&body)
             .send()
             .await
@@ -61,11 +81,179 @@ impl GeminiProvider {
             return Err(ProviderError::RequestError(format!("HTTP {status}: {text}")));
         }
 
-        parse_oai_response(resp).await
+        parse_google_response(resp).await
     }
 }
 
-// --- Shared OpenAI-compatible helpers ---
+fn build_google_contents(
+    messages: &[Message],
+    is_gemma: bool,
+) -> (Vec<serde_json::Value>, Option<serde_json::Value>) {
+    let system_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.as_text().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let system_instruction = if !system_texts.is_empty() && !is_gemma {
+        Some(json!({ "parts": [{ "text": system_texts.join("\n\n") }] }))
+    } else {
+        None
+    };
+
+    // Gemma has no systemInstruction field — fold the system text into the first user turn.
+    let gemma_system_prefix = if is_gemma && !system_texts.is_empty() {
+        Some(format!("{}\n\n", system_texts.join("\n\n")))
+    } else {
+        None
+    };
+    let mut gemma_prefix_applied = false;
+
+    let mut contents: Vec<serde_json::Value> = Vec::new();
+
+    for m in messages {
+        if m.role == Role::System {
+            continue;
+        }
+
+        match &m.content {
+            MessageContent::Text(text) => {
+                let role = match m.role {
+                    Role::User | Role::Tool => "user",
+                    Role::Assistant => "model",
+                    Role::System => unreachable!(),
+                };
+                let mut final_text = text.clone();
+                if role == "user" && !gemma_prefix_applied {
+                    if let Some(prefix) = &gemma_system_prefix {
+                        final_text = format!("{prefix}{text}");
+                        gemma_prefix_applied = true;
+                    }
+                }
+                contents.push(json!({
+                    "role": role,
+                    "parts": [{ "text": final_text }]
+                }));
+            }
+            MessageContent::UserWithImage { text, images } => {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                for img in images {
+                    parts.push(json!({
+                        "inlineData": {
+                            "mimeType": img.media_type,
+                            "data": img.base64_data,
+                        }
+                    }));
+                }
+                let mut final_text = text.clone();
+                if !gemma_prefix_applied {
+                    if let Some(prefix) = &gemma_system_prefix {
+                        final_text = format!("{prefix}{text}");
+                        gemma_prefix_applied = true;
+                    }
+                }
+                if !final_text.is_empty() {
+                    parts.push(json!({ "text": final_text }));
+                }
+                contents.push(json!({ "role": "user", "parts": parts }));
+            }
+            MessageContent::ToolResult { name, content, .. } => {
+                let response_value: serde_json::Value = serde_json::from_str(content)
+                    .unwrap_or_else(|_| json!({ "result": content }));
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": name,
+                            "response": response_value,
+                        }
+                    }]
+                }));
+            }
+            MessageContent::AssistantWithToolCalls { text, tool_calls } => {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        parts.push(json!({ "text": t }));
+                    }
+                }
+                for tc in tool_calls {
+                    let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or_else(|_| json!({}));
+                    parts.push(json!({
+                        "functionCall": {
+                            "name": tc.function.name,
+                            "args": args,
+                        }
+                    }));
+                }
+                contents.push(json!({ "role": "model", "parts": parts }));
+            }
+        }
+    }
+
+    (contents, system_instruction)
+}
+
+async fn parse_google_response(resp: reqwest::Response) -> Result<LlmResponse, ProviderError> {
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ProviderError::ParseError(e.to_string()))?;
+
+    let candidate = body["candidates"]
+        .get(0)
+        .ok_or_else(|| ProviderError::ParseError("No candidates in response".into()))?;
+
+    let parts = candidate["content"]["parts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+
+    for (idx, part) in parts.iter().enumerate() {
+        if let Some(text) = part["text"].as_str() {
+            if !text.is_empty() {
+                text_parts.push(text.to_string());
+            }
+        } else if let Some(fc) = part.get("functionCall") {
+            let name = fc["name"].as_str().unwrap_or("").to_string();
+            let args = fc.get("args").cloned().unwrap_or(json!({}));
+            let arguments = serde_json::to_string(&args)
+                .map_err(|e| ProviderError::ParseError(e.to_string()))?;
+            tool_calls.push(ToolCall {
+                id: format!("call_{idx}"),
+                function: ToolCallFunction { name, arguments },
+            });
+        }
+    }
+
+    let content = if text_parts.is_empty() {
+        None
+    } else {
+        Some(text_parts.join(""))
+    };
+
+    let usage = Usage {
+        prompt_tokens: body["usageMetadata"]["promptTokenCount"]
+            .as_u64()
+            .unwrap_or(0) as u32,
+        completion_tokens: body["usageMetadata"]["candidatesTokenCount"]
+            .as_u64()
+            .unwrap_or(0) as u32,
+    };
+
+    Ok(LlmResponse {
+        content,
+        tool_calls,
+        usage,
+    })
+}
+
+// --- Shared OpenAI-compatible helpers (used by groq, mistral) ---
 
 pub fn build_oai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     messages
